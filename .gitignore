@@ -1,0 +1,18 @@
+# Python Virtual Environments
+venv/
+.venv/
+env/
+
+# Environment Variable & Secret Files
+.env
+*.pem
+*.key
+
+# Byte-compiled / Python artifacts
+__pycache__/
+*.py[cod]
+
+# IDE and OS specific
+.vscode/
+.idea/
+.DS_Store

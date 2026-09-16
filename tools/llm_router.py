@@ -1,12 +1,16 @@
 import os
 from openai import OpenAI
+import tools.config  # Loads .env before the client reads its settings.
 
-# Initialize client using environment variable
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Initialize the OpenAI-compatible client using the SoClass gateway settings.
+client = OpenAI(
+    api_key=os.getenv("SOCLAAS_API_KEY"),
+    base_url=os.getenv("SOCLAAS_BASE_URL"),
+)
 
 def call_openai(prompt: str, require_deep_reasoning: bool = False) -> str:
     """Routes prompts to gpt-4o-mini by default, or o3-mini for heavy reasoning tasks."""
-    model_name = "o3-mini" if require_deep_reasoning else "gpt-4o-mini"
+    model_name = "coding" if require_deep_reasoning else "default"
     
     # Configure parameter based on model family
     extra_params = {}

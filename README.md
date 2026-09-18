@@ -36,3 +36,53 @@ docker run --rm -it `
   --name agent_runner `
   incypher-agent:latest
 ```
+
+## Module diagram
+
+```mermaid
+classDiagram
+    class agent_py {
+        +main()
+    }
+    class ctfd_api_py {
+        +get_challenges()
+        +get_challenge_details()
+        +extract_challenge_description()
+        +download_challenge_files()
+    }
+    class preflight_py {
+        +main()
+        +check_soclaas_connection()
+        +check_challenge_description_retrieval()
+        +check_challenge_file_download()
+    }
+    class context_py {
+        +store_context()
+        +get_context()
+        +append_context()
+    }
+    class config_py {
+        +load_dotenv()
+    }
+    class llm_router_py {
+        +call_openai()
+    }
+    class web_chal_py
+    class port_chal_py
+    class file_chal_py
+    class tcp_client_py {
+        +interact_tcp()
+    }
+    class solver_py {
+        +connect()
+    }
+
+    agent_py --> ctfd_api_py : retrieves challenge data
+    preflight_py --> ctfd_api_py : verifies API data
+    ctfd_api_py --> config_py : loads credentials
+    llm_router_py --> config_py : loads credentials
+    tcp_client_py --> solver_py : opens TCP connection
+    web_chal_py --> context_py : planned context use
+    port_chal_py --> context_py : planned context use
+    file_chal_py --> context_py : planned context use
+```

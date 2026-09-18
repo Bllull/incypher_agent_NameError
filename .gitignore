@@ -12,6 +12,9 @@ env/
 __pycache__/
 *.py[cod]
 
+# Local agent context storage
+.agent_data/
+
 # IDE and OS specific
 .vscode/
 .idea/

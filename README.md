@@ -11,7 +11,7 @@ pip install -r requirements.txt
 Copy-Item .env.example .env
 ```
 
-Configure `.env` with your credentials:
+Configure `.env` with your credentials. For SOCLAAS, follow [https://dochub.comp.nus.edu.sg/cf/guides/soclaas/start](https://dochub.comp.nus.edu.sg/cf/guides/soclaas/start) (You need to be on NUS wifi or be logged into the NUS VPN):
 
 ```dotenv
 IN_CYPHER_DOCKER_PLATFORM_AVAILABLE=false

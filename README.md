@@ -3,8 +3,8 @@
 ## Local setup (PowerShell)
 
 ```powershell
-git clone https://github.com/HisFun2305/incypher-agent-NameError.git
-cd incypher-agent-NameError
+git clone https://github.com/HisFun2305/incypher_agent_NameError.git
+cd incypher_agent_NameError
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt

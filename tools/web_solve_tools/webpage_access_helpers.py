@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 import re
 from html.parser import HTMLParser
 from typing import Any
@@ -10,11 +9,10 @@ from urllib.parse import urljoin
 
 import requests
 
-from tools.context import append_context
+from tools.context import update_context
 from tools.http_client import create_session, interact_http
 
 
-VALIDATED_FORM_HEADER = "[VALIDATED_WEB_FORM_SCHEMA]"
 # Form schemas are workflow data, not challenge metadata. Keep them in the
 # reserved shared context record instead of appending to a challenge record.
 WEB_CONTEXT_ID = -1000
@@ -80,21 +78,15 @@ class _FormParser(HTMLParser):
             self._form = None
 
 
-def _validated_schema_from_context(context: str | None) -> dict[str, Any] | None:
+def _validated_schema_from_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the most recently stored validated schema from context."""
-    if not context or VALIDATED_FORM_HEADER not in context:
-        return None
-    tail = context.rsplit(VALIDATED_FORM_HEADER, 1)[1].lstrip(" :\r\n")
-    try:
-        value, _ = json.JSONDecoder().raw_decode(tail)
-    except json.JSONDecodeError:
-        return None
+    value = context.get("validated_form_schema") if context else None
     return value if isinstance(value, dict) and isinstance(value.get("fields"), dict) else None
 
 
 def get_form_json(
     challenge_url: str,
-    context: str | None = None,
+    context: dict[str, Any] | None = None,
     session: requests.Session | None = None,
     chal_ID: int | None = None,
 ) -> dict[str, Any]:
@@ -204,10 +196,7 @@ def append_validated_form_context(chal_ID: int, form_schema: dict[str, Any]) -> 
     provide it, but web-specific data is intentionally never stored under that
     challenge ID.
     """
-    append_context(
-        f"{VALIDATED_FORM_HEADER}\n{json.dumps(form_schema, sort_keys=True)}",
-        WEB_CONTEXT_ID,
-    )
+    update_context({"validated_form_schema": form_schema}, WEB_CONTEXT_ID)
 
 
 def extract_flag(text: str) -> str | None:

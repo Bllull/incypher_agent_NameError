@@ -4,11 +4,11 @@ from __future__ import annotations
 
 
 from tools.context import (
-    append_context,
     get_chal_file_path,
     get_context,
     store_chal_file_path,
     store_context,
+    update_context,
 )
 from tools.ctfd_api import (
     connect_challenge_tcp,

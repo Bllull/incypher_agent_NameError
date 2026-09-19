@@ -7,7 +7,7 @@ from collections.abc import Sequence
 
 import requests
 
-from tools.context import append_context, get_chal_file_path, get_context
+from tools.context import get_chal_file_path, get_context, update_context
 from tools.ctfd_api import get_challenge_url
 from tools.http_client import create_session
 from tools.llm_router import call_openai
@@ -30,8 +30,8 @@ def identify_web_subtype(chal_ID: int) -> str:
     ``"UNKNOWN"``. Keeping the output constrained makes it safe for the
     dispatcher to grow with additional subtype-specific workflows later.
     """
-    challenge_context = get_context(chal_ID) or ""
-    web_context = get_context(WEB_CONTEXT_ID) or ""
+    challenge_context = get_context(chal_ID) or {}
+    web_context = get_context(WEB_CONTEXT_ID) or {}
     prompt = f"""You are classifying a web CTF challenge for a workflow dispatcher.
 
 Read the challenge context below and identify its subtype. The only currently
@@ -41,10 +41,10 @@ UNKNOWN. Do not explain your answer.
 
 Challenge ID: {chal_ID}
 Challenge context:
-{challenge_context}
+{json.dumps(challenge_context, sort_keys=True)}
 
 Previously collected web workflow context:
-{web_context}
+{json.dumps(web_context, sort_keys=True)}
 """
     try:
         answer = call_openai(prompt).strip().upper()
@@ -70,16 +70,12 @@ def _solve_ssti(
     # here ensures the dispatcher remains independent of SSTI details.
     probes = DEFAULT_SSTI_PROBES
 
-    challenge_context = get_context(chal_ID) or ""
-    web_context = get_context(WEB_CONTEXT_ID) or ""
-    context = "\n\n".join(
-        part for part in (challenge_context, web_context) if part
-    )
+    web_context = get_context(WEB_CONTEXT_ID) or {}
     challenge_url = get_challenge_url(chal_ID)
     session = create_session()
     form_schema = get_form_json(
         challenge_url,
-        context=context,
+        context=web_context,
         session=session,
         chal_ID=chal_ID,
     )
@@ -106,10 +102,7 @@ def _solve_ssti(
         }
         for payload, response in zip(overrides, responses)
     ]
-    append_context(
-        "[SSTI_RESPONSES]\n" + json.dumps(response_records, sort_keys=True),
-        WEB_CONTEXT_ID,
-    )
+    update_context({"ssti_responses": response_records}, WEB_CONTEXT_ID)
     for response in responses:
         flag = extract_flag(response.text)
         if flag:

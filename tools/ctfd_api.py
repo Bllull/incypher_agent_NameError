@@ -2,7 +2,10 @@ import requests
 import os
 import tools.config  # Loads .env before API settings are read.
 import re
+import shlex
+import socket
 from pathlib import Path
+from typing import Any, Literal
 from urllib.parse import unquote, urljoin, urlparse
 
 PLATFORM_URL = os.getenv("PLATFORM_URL", "https://hackathon.in-cypher.com")
@@ -24,6 +27,23 @@ def extract_challenge_description(challenge_id: int) -> str:
     return description.strip() if isinstance(description, str) else ""
 
 
+def identify_challenge_type(challenge_id: int) -> Literal["file", "url", "tcp"]:
+    """Classify a challenge from its CTFd detail fields.
+
+    A non-empty ``files`` list takes priority, followed by ``http`` in the
+    Markdown description. All remaining challenges are treated as TCP.
+    """
+    details = get_challenge_details(challenge_id)
+    files = details.get("files")
+    if isinstance(files, list) and files:
+        return "file"
+
+    description = details.get("description", "")
+    if isinstance(description, str) and "http" in description.lower():
+        return "url"
+    return "tcp"
+
+
 def _challenge_directory_name(challenge_name: str) -> str:
     """Return a filesystem-safe directory name for one challenge."""
     name = re.sub(r"[^a-zA-Z0-9._-]+", "_", challenge_name).strip("._")
@@ -35,6 +55,65 @@ def _download_filename(file_url: str, index: int) -> str:
     filename = Path(unquote(urlparse(file_url).path)).name
     filename = re.sub(r"[^a-zA-Z0-9._-]+", "_", filename).strip("._")
     return filename or f"file_{index}"
+
+
+def _docker_platform_available() -> bool:
+    """Return the configured CTFd container-deployment mode."""
+    value = os.getenv(DOCKER_PLATFORM_AVAILABLE_ENV, "false").strip().lower()
+    if value in {"true", "1", "yes"}:
+        return True
+    if value in {"false", "0", "no", ""}:
+        return False
+    raise ValueError(
+        f"{DOCKER_PLATFORM_AVAILABLE_ENV} must be true or false, not {value!r}"
+    )
+
+
+def _tcp_target(host: Any, port: Any) -> tuple[str, int]:
+    """Validate and normalize a TCP host and port."""
+    if not isinstance(host, str) or not host.strip():
+        raise ValueError("A non-empty TCP host is required")
+    try:
+        normalized_port = int(port)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("A numeric TCP port is required") from exc
+    if not 1 <= normalized_port <= 65535:
+        raise ValueError("TCP port must be between 1 and 65535")
+    return host.strip(), normalized_port
+
+
+def connect_challenge_tcp(
+    challenge_id: int,
+    timeout: int = 15,
+    challenge_name: str | None = None,
+) -> socket.socket:
+    """Open a TCP connection to an automatic or manually deployed challenge.
+
+    When ``IN_CYPHER_DOCKER_PLATFORM_AVAILABLE`` is true, CTFd deploys the
+    challenge and supplies its ``ip`` and ``port``. Otherwise the operator is
+    prompted for exactly ``nc HOST PORT``. The prompt identifies the challenge
+    as ``[challenge_id] challenge name``. The caller owns the returned socket
+    and must close it after use.
+    """
+    if _docker_platform_available():
+        deployment = deploy_instance(challenge_id)
+        if not isinstance(deployment, dict):
+            raise ValueError("CTFd deployment response must be an object")
+        host, port = _tcp_target(deployment.get("ip"), deployment.get("port"))
+    else:
+        if challenge_name is None:
+            details = get_challenge_details(challenge_id)
+            challenge_name = str(details.get("name", "unnamed"))
+        command = input(
+            f"Enter the manually deployed TCP endpoint for [{challenge_id}] {challenge_name} "
+            "as 'nc HOST PORT': "
+        )
+        parts = shlex.split(command)
+        if len(parts) != 3 or parts[0].lower() != "nc":
+            raise ValueError("Manual TCP endpoint must use the form: nc HOST PORT")
+        host, port = _tcp_target(parts[1], parts[2])
+
+    return socket.create_connection((host, port), timeout=timeout)
 
 
 def download_challenge_files(challenge_name: str, challenge_id: int) -> list[str]:
@@ -87,7 +166,7 @@ def get_challenge_details(challenge_id: int):
     res.raise_for_status()
     return res.json().get("data", {})
 
-def challenge_page_url(challenge_name: str, challenge_id: int) -> str:
+def connect_challenge_url(challenge_name: str, challenge_id: int) -> str:
     """Deploy through CTFd or request a manually deployed challenge URL.
 
     Set ``IN_CYPHER_DOCKER_PLATFORM_AVAILABLE=true`` to use CTFd's container
@@ -96,15 +175,9 @@ def challenge_page_url(challenge_name: str, challenge_id: int) -> str:
     """
     slug = re.sub(r"[^a-z0-9]+", "-", challenge_name.lower()).strip("-")
     ctfd_page_url = f"{PLATFORM_URL.rstrip('/')}/challenges#{slug}-{challenge_id}"
-    docker_available = os.getenv(DOCKER_PLATFORM_AVAILABLE_ENV, "false").strip().lower()
-
-    if docker_available in {"true", "1", "yes"}:
+    if _docker_platform_available():
         deploy_instance(challenge_id)
         return ctfd_page_url
-    if docker_available not in {"false", "0", "no", ""}:
-        raise ValueError(
-            f"{DOCKER_PLATFORM_AVAILABLE_ENV} must be true or false, not {docker_available!r}"
-        )
 
     manual_url = input(
         f"Deploy [{challenge_id}] {challenge_name} manually at {ctfd_page_url}, "

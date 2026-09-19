@@ -8,15 +8,20 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 from openai import OpenAI
 
 import tools.config  # Load repository-local credentials before reading them.
+from tools.context import get_context
 from tools.ctfd_api import (
     PLATFORM_URL,
+    connect_challenge_tcp,
+    connect_challenge_url,
     download_challenge_files,
     extract_challenge_description,
     get_challenges,
+    identify_challenge_type,
 )
 
 
@@ -39,13 +44,77 @@ def check_soclaas_connection() -> bool:
     return True
 
 
+def check_challenge_url_connection(challenges: list[dict]) -> bool:
+    """Verify that a challenge URL can be deployed or entered manually."""
+    print("[*] Testing challenge URL connection...")
+    for challenge in challenges:
+        challenge_name = str(challenge.get("name", "unnamed"))
+        try:
+            challenge_id = int(challenge.get("id")) #type: ignore
+            if identify_challenge_type(challenge_id) != "url":
+                continue
+            challenge_url = connect_challenge_url(challenge_name, challenge_id)
+        except (TypeError, ValueError) as exc:
+            print(f"[-] Challenge URL connection failed for {challenge_name}: {exc}")
+            continue
+        except Exception as exc:
+            print(f"[-] Could not connect to challenge URL for {challenge_name}: {exc}")
+            continue
+
+        parsed = urlparse(challenge_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            print(f"[-] Challenge URL is not a valid HTTP(S) URL: {challenge_url}")
+            continue
+        print(f"[+] Challenge URL connection succeeded for [{challenge_id}] {challenge_name}.")
+        return True
+
+    print("[-] No challenge URL connection succeeded.")
+    return False
+
+
+def check_challenge_tcp_connection(challenges: list[dict]) -> bool:
+    """Verify one TCP challenge connection identified from its detail fields."""
+    print("[*] Looking for a TCP challenge to verify connection...")
+    tcp_challenge_found = False
+    for challenge in challenges:
+        challenge_name = str(challenge.get("name", "unnamed"))
+        try:
+            challenge_id = int(challenge.get("id")) #type: ignore
+            if identify_challenge_type(challenge_id) != "tcp":
+                continue
+        except (TypeError, ValueError) as exc:
+            print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
+            continue
+        except Exception as exc:
+            print(f"[-] Could not retrieve details for {challenge_name}: {exc}")
+            continue
+
+        tcp_challenge_found = True
+
+        try:
+            connection = connect_challenge_tcp(challenge_id, challenge_name=challenge_name)
+            connection.close()
+        except Exception as exc:
+            print(f"[-] TCP connection failed for [{challenge_id}] {challenge_name}: {exc}")
+            continue
+
+        print(f"[+] TCP connection succeeded for [{challenge_id}] {challenge_name}.")
+        return True
+
+    if not tcp_challenge_found:
+        print("[+] No TCP challenge was identified; skipping TCP connection verification.")
+        return True
+    print("[-] No advertised TCP challenge connection succeeded.")
+    return False
+
+
 def check_challenge_description_retrieval(challenges: list[dict]) -> bool:
     """Verify that at least one CTFd ``data.description`` value is retrieved."""
     print("[*] Looking for a challenge description to verify retrieval...")
     for challenge in challenges:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
-            challenge_id = int(challenge.get("id"))
+            challenge_id = int(challenge.get("id")) #type: ignore
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
             continue
@@ -80,7 +149,7 @@ def check_challenge_file_download(challenges: list[dict]) -> bool:
     for challenge in challenges:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
-            challenge_id = int(challenge.get("id"))
+            challenge_id = int(challenge.get("id")) #type: ignore
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
             continue
@@ -107,6 +176,18 @@ def check_challenge_file_download(challenges: list[dict]) -> bool:
         return True
 
     print("[+] No challenge files were available to test; skipping download verification.")
+    return True
+
+
+def check_context_sqlite_connection() -> bool:
+    """Verify that the local SQLite-backed context store can be opened."""
+    print("[*] Testing local context SQLite connection...")
+    try:
+        get_context(0)
+    except Exception as exc:
+        print(f"[-] Context SQLite connection failed: {exc}")
+        return False
+    print("[+] Context SQLite connection succeeded.")
     return True
 
 
@@ -138,9 +219,15 @@ def main() -> int:
         value = challenge.get("value", "unknown")
         print(f"    [{challenge_id}] {name} | category={category} | value={value}")
 
+    if not check_challenge_url_connection(challenges):
+        return 1
+    if not check_challenge_tcp_connection(challenges):
+        return 1
     if not check_challenge_description_retrieval(challenges):
         return 1
     if not check_challenge_file_download(challenges):
+        return 1
+    if not check_context_sqlite_connection():
         return 1
     return 0
 

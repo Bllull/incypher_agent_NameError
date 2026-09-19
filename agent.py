@@ -7,7 +7,7 @@ retrieves the challenge list, each challenge's detail record, and its URL.
 from __future__ import annotations
 
 from tools.ctfd_api import (
-    challenge_page_url,
+    connect_challenge_url,
     extract_challenge_description,
     get_challenges,
 )
@@ -36,7 +36,7 @@ def main() -> None:
         except Exception as exc:
             print(f"[-] Could not retrieve details for [{challenge_id}] {challenge_name}: {exc}")
             continue
-        page_url = challenge_page_url(challenge_name, challenge_id)
+        page_url = connect_challenge_url(challenge_name, challenge_id)
         print(f"[+] [{challenge_id}] {challenge_name} | page={page_url}")
         print(f"    Description: {description or '(none)'}")
 

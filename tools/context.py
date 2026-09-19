@@ -27,6 +27,7 @@ def _connect() -> sqlite3.Connection:
         CREATE TABLE IF NOT EXISTS challenge_contexts (
             challenge_id INTEGER PRIMARY KEY,
             context TEXT NOT NULL,
+            filepath TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
@@ -91,6 +92,30 @@ def append_context(context: str, chal_ID: int) -> None:
         )
 
 
+def store_chal_file_path(filepath: str, chal_ID: int) -> None:
+    """Store or replace the local challenge-file path for a challenge."""
+    challenge_id = _validate_challenge_id(chal_ID)
+    if not isinstance(filepath, str) or not filepath.strip():
+        raise ValueError("filepath must be a non-empty string")
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO challenge_contexts (challenge_id, context, filepath)
+            VALUES (?, '', ?)
+            ON CONFLICT(challenge_id) DO UPDATE SET
+                filepath = excluded.filepath,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (challenge_id, filepath),
+        )
+
+
 def get_chal_file_path(chal_ID: int) -> str | None:
     """Return the local path of a challenge download, when available."""
-    pass
+    challenge_id = _validate_challenge_id(chal_ID)
+    with _connect() as connection:
+        row = connection.execute(
+            "SELECT filepath FROM challenge_contexts WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()
+    return row[0] if row and row[0] is not None else None

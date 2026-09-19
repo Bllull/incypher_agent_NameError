@@ -82,11 +82,7 @@ def _tcp_target(host: Any, port: Any) -> tuple[str, int]:
     return host.strip(), normalized_port
 
 
-def connect_challenge_tcp(
-    challenge_id: int,
-    timeout: int = 15,
-    challenge_name: str | None = None,
-) -> socket.socket:
+def connect_challenge_tcp(challenge_id: int, timeout: int = 15) -> socket.socket:
     """Open a TCP connection to an automatic or manually deployed challenge.
 
     When ``IN_CYPHER_DOCKER_PLATFORM_AVAILABLE`` is true, CTFd deploys the
@@ -101,9 +97,8 @@ def connect_challenge_tcp(
             raise ValueError("CTFd deployment response must be an object")
         host, port = _tcp_target(deployment.get("ip"), deployment.get("port"))
     else:
-        if challenge_name is None:
-            details = get_challenge_details(challenge_id)
-            challenge_name = str(details.get("name", "unnamed"))
+        details = get_challenge_details(challenge_id)
+        challenge_name = str(details.get("name", "unnamed"))
         command = input(
             f"Enter the manually deployed TCP endpoint for [{challenge_id}] {challenge_name} "
             "as 'nc HOST PORT': "
@@ -166,13 +161,15 @@ def get_challenge_details(challenge_id: int):
     res.raise_for_status()
     return res.json().get("data", {})
 
-def connect_challenge_url(challenge_name: str, challenge_id: int) -> str:
+def get_challenge_url(challenge_id: int) -> str:
     """Deploy through CTFd or request a manually deployed challenge URL.
 
     Set ``IN_CYPHER_DOCKER_PLATFORM_AVAILABLE=true`` to use CTFd's container
     deployment API. Otherwise, the operator is shown the CTFd challenge page
     and asked to paste the URL of a manually deployed instance.
     """
+    details = get_challenge_details(challenge_id)
+    challenge_name = str(details.get("name", "unnamed"))
     slug = re.sub(r"[^a-z0-9]+", "-", challenge_name.lower()).strip("-")
     ctfd_page_url = f"{PLATFORM_URL.rstrip('/')}/challenges#{slug}-{challenge_id}"
     if _docker_platform_available():

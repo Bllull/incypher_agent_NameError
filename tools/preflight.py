@@ -17,7 +17,7 @@ from tools.context import get_context
 from tools.ctfd_api import (
     PLATFORM_URL,
     connect_challenge_tcp,
-    connect_challenge_url,
+    get_challenge_url,
     download_challenge_files,
     extract_challenge_description,
     get_challenges,
@@ -53,7 +53,7 @@ def check_challenge_url_connection(challenges: list[dict]) -> bool:
             challenge_id = int(challenge.get("id")) #type: ignore
             if identify_challenge_type(challenge_id) != "url":
                 continue
-            challenge_url = connect_challenge_url(challenge_name, challenge_id)
+            challenge_url = get_challenge_url(challenge_id)
         except (TypeError, ValueError) as exc:
             print(f"[-] Challenge URL connection failed for {challenge_name}: {exc}")
             continue
@@ -92,7 +92,7 @@ def check_challenge_tcp_connection(challenges: list[dict]) -> bool:
         tcp_challenge_found = True
 
         try:
-            connection = connect_challenge_tcp(challenge_id, challenge_name=challenge_name)
+            connection = connect_challenge_tcp(challenge_id)
             connection.close()
         except Exception as exc:
             print(f"[-] TCP connection failed for [{challenge_id}] {challenge_name}: {exc}")

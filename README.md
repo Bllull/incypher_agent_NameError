@@ -51,7 +51,7 @@ classDiagram
         +identify_challenge_type()
         +extract_challenge_description()
         +download_challenge_files()
-        +connect_challenge_url()
+        +get_challenge_url()
         +connect_challenge_tcp()
     }
     class preflight_py {

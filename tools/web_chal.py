@@ -1,201 +1,140 @@
-"""HTTP form discovery and validation for URL-based CTF challenges."""
+"""Orchestration for URL-based CTF challenges."""
 
 from __future__ import annotations
 
 import json
-import re
-from html.parser import HTMLParser
-from typing import Any
-from urllib.parse import urljoin
 
 import requests
 
 from tools.context import append_context, get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
-from tools.http_client import create_session, interact_http
+from tools.http_client import create_session
+from tools.llm_router import call_openai
+from tools.web_solve_tools.webpage_access_helpers import extract_flag, get_form_json, submit_form
 
 
-VALIDATED_FORM_HEADER = "[VALIDATED_WEB_FORM_SCHEMA]"
-_FLAG_PATTERN = re.compile(r"INCYPHER\{[^\r\n}]+\}")
+WEB_CHALLENGE_SUBTYPES = ("SSTI",)
+# Temporary compatibility probes. The solver accepts a runtime probe list so
+# a later LLM iteration can supply these without changing the submit/store
+# workflow.
+DEFAULT_SSTI_PROBES = ("{{7*7}}", "${7*7}", "<%= 7*7 %>")
+# Reserved context record for data produced by the web-solving workflow.
+WEB_CONTEXT_ID = -1000
 
 
-class _FormParser(HTMLParser):
-    """Extract the first usable HTML form without extra dependencies."""
+def identify_web_subtype(chal_ID: int) -> str:
+    """Classify a web challenge from its stored context using the configured LLM.
 
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.forms: list[dict[str, Any]] = []
-        self._form: dict[str, Any] | None = None
-        self._select: dict[str, Any] | None = None
-        self._textarea: dict[str, Any] | None = None
+    The returned value is always one of ``WEB_CHALLENGE_SUBTYPES`` or
+    ``"UNKNOWN"``. Keeping the output constrained makes it safe for the
+    dispatcher to grow with additional subtype-specific workflows later.
+    """
+    challenge_context = get_context(chal_ID) or ""
+    web_context = get_context(WEB_CONTEXT_ID) or ""
+    prompt = f"""You are classifying a web CTF challenge for a workflow dispatcher.
 
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        attributes = {key.lower(): value or "" for key, value in attrs}
-        tag = tag.lower()
-        if tag == "form":
-            self._form = {
-                "action": attributes.get("action", ""),
-                "method": attributes.get("method", "get").upper(),
-                "fields": {},
-            }
-            self.forms.append(self._form)
-            return
-        if self._form is None:
-            return
-        if tag == "select":
-            self._select = {"name": attributes.get("name", ""), "value": None, "first": None}
-        elif tag == "option" and self._select is not None:
-            value = attributes.get("value", "")
-            self._select["first"] = self._select["first"] or value
-            if "selected" in attributes:
-                self._select["value"] = value
-        elif tag == "textarea":
-            self._textarea = {"name": attributes.get("name", ""), "text": []}
-        elif tag == "input":
-            name = attributes.get("name", "")
-            input_type = attributes.get("type", "text").lower()
-            if not name or input_type in {"submit", "button", "reset", "image", "file"}:
-                return
-            if input_type in {"checkbox", "radio"} and "checked" not in attributes:
-                return
-            self._form["fields"][name] = attributes.get("value", "")
+Read the challenge context below and identify its subtype. The only currently
+supported subtype is SSTI (server-side template injection). Return exactly one
+token: SSTI if the context indicates an SSTI challenge; otherwise return
+UNKNOWN. Do not explain your answer.
 
-    def handle_data(self, data: str) -> None:
-        if self._textarea is not None:
-            self._textarea["text"].append(data)
+Challenge ID: {chal_ID}
+Challenge context:
+{challenge_context}
 
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag == "textarea" and self._textarea is not None and self._form is not None:
-            if self._textarea["name"]:
-                self._form["fields"][self._textarea["name"]] = "".join(self._textarea["text"])
-            self._textarea = None
-        elif tag == "select" and self._select is not None and self._form is not None:
-            if self._select["name"]:
-                self._form["fields"][self._select["name"]] = self._select["value"] or self._select["first"] or ""
-            self._select = None
-        elif tag == "form":
-            self._form = None
-
-
-def _validated_schema_from_context(context: str | None) -> dict[str, Any] | None:
-    """Return the most recently stored validated schema from context."""
-    if not context or VALIDATED_FORM_HEADER not in context:
-        return None
-    tail = context.rsplit(VALIDATED_FORM_HEADER, 1)[1].lstrip(" :\r\n")
+Previously collected web workflow context:
+{web_context}
+"""
     try:
-        value, _ = json.JSONDecoder().raw_decode(tail)
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) and isinstance(value.get("fields"), dict) else None
+        answer = call_openai(prompt).strip().upper()
+    except Exception as exc:
+        print(f"[web] Challenge {chal_ID} subtype classification failed: {exc}")
+        return "UNKNOWN"
+
+    # Accept harmless formatting from the model while still enforcing the
+    # preset vocabulary used by the dispatcher.
+    match = next((subtype for subtype in WEB_CHALLENGE_SUBTYPES if subtype in answer), None)
+    return match or "UNKNOWN"
 
 
-def get_form_json(
-    challenge_url: str,
-    context: str | None = None,
-    session: requests.Session | None = None,
-) -> dict[str, Any]:
-    """Discover a form, prioritising a previously validated context schema."""
-    cached = _validated_schema_from_context(context)
-    if cached is not None:
-        return cached
-    http = session or create_session()
-    response = interact_http(http, challenge_url, method="GET")
-    response.raise_for_status()
-    parser = _FormParser()
-    parser.feed(response.text)
-    if not parser.forms:
-        raise ValueError(f"No HTML form found at {challenge_url}")
-    form = parser.forms[0]
-    method = form["method"] if form["method"] in {"GET", "POST"} else "GET"
-    action = urljoin(response.url, form["action"] or response.url)
-    return {"url": action, "method": method, "fields": dict(form["fields"])}
+def _solve_ssti(
+    chal_ID: int,
+) -> str | None:
+    """Submit supplied SSTI probes and retain the response list.
 
+    Probe selection belongs inside this subtype workflow. The current default
+    keeps the existing behavior until the LLM probe-selection step is added.
+    """
+    # Replace this local selection with the future LLM interaction. Keeping it
+    # here ensures the dispatcher remains independent of SSTI details.
+    probes = DEFAULT_SSTI_PROBES
 
-def submit_form(form_schema: dict[str, Any], session: requests.Session | None = None) -> requests.Response:
-    """Submit a form schema and return the complete HTTP response."""
-    url = str(form_schema.get("url", ""))
-    method = str(form_schema.get("method", "GET")).upper()
+    challenge_context = get_context(chal_ID) or ""
+    web_context = get_context(WEB_CONTEXT_ID) or ""
+    context = "\n\n".join(
+        part for part in (challenge_context, web_context) if part
+    )
+    challenge_url = get_challenge_url(chal_ID)
+    session = create_session()
+    form_schema = get_form_json(
+        challenge_url,
+        context=context,
+        session=session,
+        chal_ID=chal_ID,
+    )
+    print(f"[web][SSTI] Form schema: {json.dumps(form_schema, sort_keys=True)}")
     fields = form_schema.get("fields", {})
-    if not url or not isinstance(fields, dict):
-        raise ValueError("form_schema must contain a URL and a fields object")
-    response = interact_http(
-        session or create_session(),
-        url,
-        method=method,
-        params=fields if method == "GET" else None,
-        data=fields if method == "POST" else None,
-    )
-    print(f"[web] form response: status={response.status_code} url={response.url}")
-    print(response.text)
-    return response
-
-
-def _test_value(field_name: str, current: Any) -> str:
-    """Choose a harmless deterministic value for an empty form field."""
-    if current not in (None, ""):
-        return str(current)
-    name = field_name.lower()
-    if "email" in name:
-        return "ctf-test@example.com"
-    if any(word in name for word in ("url", "uri", "link")):
-        return "https://example.com"
-    if any(word in name for word in ("num", "count", "age", "id")):
-        return "1"
-    return "test"
-
-
-def validate_form_json(
-    form_schema: dict[str, Any],
-    session: requests.Session | None = None,
-    test_variables: dict[str, Any] | None = None,
-) -> bool:
-    """Submit test variables and validate the response status."""
-    fields = form_schema.get("fields")
     if not isinstance(fields, dict) or not fields:
-        return False
-    tested = {name: _test_value(name, value) for name, value in fields.items()}
-    if test_variables:
-        tested.update(test_variables)
-    try:
-        response = submit_form({**form_schema, "fields": tested}, session=session)
-    except (requests.RequestException, ValueError) as exc:
-        print(f"[web] form validation failed: {exc}")
-        return False
-    valid = 200 <= response.status_code < 400
-    print(f"[web] form validation: {'passed' if valid else 'failed'}")
-    return valid
+        raise ValueError("The validated SSTI form contains no fields")
 
+    overrides = [
+        {field_name: probe}
+        for field_name in fields
+        for probe in probes
+    ]
+    responses = submit_form(form_schema, values=overrides, session=session)
+    if not isinstance(responses, list):
+        raise TypeError("Repeated SSTI submission did not return response list")
 
-def append_validated_form_context(chal_ID: int, form_schema: dict[str, Any]) -> None:
-    """Append a labelled validated schema for reuse on the next pass."""
+    response_records = [
+        {
+            "field": payload,
+            "status_code": response.status_code,
+            "url": response.url,
+            "text": response.text[:4000],
+        }
+        for payload, response in zip(overrides, responses)
+    ]
     append_context(
-        f"{VALIDATED_FORM_HEADER}\n{json.dumps(form_schema, sort_keys=True)}",
-        chal_ID,
+        "[SSTI_RESPONSES]\n" + json.dumps(response_records, sort_keys=True),
+        WEB_CONTEXT_ID,
     )
+    for response in responses:
+        flag = extract_flag(response.text)
+        if flag:
+            return flag
+    return None
 
 
 def web_chal_solver(chal_ID: int) -> str | None:
-    """Discover, test, and persist the first form for a web challenge."""
+    """Classify a web challenge, then dispatch to its subtype workflow."""
     context = get_context(chal_ID)
     print(f"[web] Challenge {chal_ID} context: {context!r}")
     print(f"[web] Challenge {chal_ID} file path: {get_chal_file_path(chal_ID)!r}")
+    subtype = identify_web_subtype(chal_ID)
+    print(f"[web] Challenge {chal_ID} subtype: {subtype}")
+    if subtype != "SSTI":
+        print(f"[web] No workflow is implemented for subtype {subtype}.")
+        return None
+
     try:
-        challenge_url = get_challenge_url(chal_ID)
-        session = create_session()
-        form_schema = get_form_json(challenge_url, context=context, session=session)
-        print(f"[web] Form schema: {json.dumps(form_schema, sort_keys=True)}")
-        if validate_form_json(form_schema, session=session):
-            append_validated_form_context(chal_ID, form_schema)
-            response = submit_form(form_schema, session=session)
-            match = _FLAG_PATTERN.search(response.text)
-            return match.group(0) if match else None
+        return _solve_ssti(chal_ID)
     except (requests.RequestException, ValueError, TypeError) as exc:
         print(f"[web] Challenge {chal_ID} form workflow failed: {exc}")
     return None   
 
-# def main():
-#     web_chal_solver(24)
+def main():
+    web_chal_solver(19)
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()

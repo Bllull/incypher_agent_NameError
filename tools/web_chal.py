@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 
 import requests
 
@@ -133,8 +134,8 @@ def web_chal_solver(chal_ID: int) -> str | None:
         print(f"[web] Challenge {chal_ID} form workflow failed: {exc}")
     return None   
 
-def main():
-    web_chal_solver(19)
+# def main():
+#     web_chal_solver(19)
 
-if __name__ == "__main__":
-    main()
+# if __name__ == "__main__":
+#     main()

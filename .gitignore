@@ -15,9 +15,6 @@ __pycache__/
 # Local agent context storage
 .agent_data/
 
-# Sandbox test files
-test_file_upload/
-
 # IDE and OS specific
 .vscode/
 .idea/

@@ -39,6 +39,8 @@ docker run --rm -it `
 
 ## Module diagram
 
+For a concise reference of the public methods, see [METHODS.md](METHODS.md).
+
 ```mermaid
 classDiagram
     class agent_py {
@@ -53,6 +55,7 @@ classDiagram
         +download_challenge_files()
         +get_challenge_url()
         +connect_challenge_tcp()
+        +submit_flag()
     }
     class preflight_py {
         +main()
@@ -64,10 +67,13 @@ classDiagram
         +check_context_sqlite_connection()
     }
     class context_py {
-        <<non-negative IDs: challenges; negative IDs: shared context>>
-        +store_context()
-        +get_context()
-        +update_context()
+        <<JSON dictionaries; non-negative IDs: challenges; negative IDs: shared context>>
+        +store_context(context, chal_ID)
+        +get_context(chal_ID) dict | None
+        +update_context(context, chal_ID)
+        +delete_context(chal_ID)
+        +store_name()
+        +get_name()
         +store_chal_file_path()
         +get_chal_file_path()
     }
@@ -76,6 +82,7 @@ classDiagram
     }
     class llm_router_py {
         +call_openai()
+        +call_multimodal_openai(prompt, image_paths, model_name)
     }
     class web_chal_py {
         +web_chal_solver(chal_ID) str | None
@@ -93,11 +100,19 @@ classDiagram
         +create_session()
         +interact_http()
     }
+    class webpage_access_helpers_py {
+        +get_form_json()
+        +submit_form()
+        +validate_form_json()
+        +append_validated_form_context()
+        +extract_flag()
+    }
     class solver_py {
         +connect()
     }
 
     agent_py --> ctfd_api_py : retrieves challenge data
+    agent_py --> context_py : stores JSON challenge context
     agent_py --> web_chal_py : delegates URL challenge
     agent_py --> port_chal_py : delegates TCP challenge
     agent_py --> file_chal_py : delegates file challenge
@@ -109,9 +124,12 @@ classDiagram
     ctfd_api_py --> config_py : loads credentials
     llm_router_py --> config_py : loads credentials
     tcp_client_py --> solver_py : opens TCP connection
-    web_chal_py --> context_py : planned context use
-    web_chal_py --> http_client_py : planned HTTP use
-    port_chal_py --> context_py : planned context use
+    web_chal_py --> context_py : reads and updates JSON context
+    web_chal_py --> llm_router_py : classifies web subtype
+    web_chal_py --> http_client_py : creates challenge session
+    web_chal_py --> webpage_access_helpers_py : discovers and submits forms
+    webpage_access_helpers_py --> context_py : stores validated schema
+    port_chal_py --> context_py : reads challenge context
     port_chal_py --> tcp_client_py : planned TCP use
-    file_chal_py --> context_py : planned context use
+    file_chal_py --> context_py : reads challenge context
 ```

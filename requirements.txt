@@ -3,3 +3,6 @@ requests
 pwntools
 pydantic
 python-dotenv
+numpy
+matplotlib
+soundfile

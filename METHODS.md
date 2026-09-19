@@ -58,6 +58,16 @@ All context records are JSON dictionaries stored in the local SQLite database.
   sends prompt text and local JPEG, PNG, GIF, or WebP images as data URLs to a
   vision-capable chat model.
 
+## File conversion
+
+### `tools/converter.py`
+
+- `convert_audio_file(audio_path, conversion_type, output_path=None)` converts
+  a SoundFile-readable mono or stereo audio file into a PNG. Stereo input is
+  down-mixed to mono. Use `1` for a spectrogram or `2` for a waveform. With no
+  destination supplied, it writes a descriptive PNG beside the source audio
+  and returns its absolute path.
+
 ## Web challenge workflow
 
 ### `tools/web_chal.py`

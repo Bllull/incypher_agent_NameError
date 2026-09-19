@@ -123,7 +123,7 @@ def check_challenge_description_retrieval(challenges: list[dict]) -> bool:
             continue
 
         try:
-            description = extract_challenge_description(challenge_id)
+            _, description = extract_challenge_description(challenge_id)
         except Exception as exc:
             print(f"[-] Could not retrieve description for {challenge_name}: {exc}")
             continue

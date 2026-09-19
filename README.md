@@ -64,6 +64,7 @@ classDiagram
         +check_context_sqlite_connection()
     }
     class context_py {
+        <<non-negative IDs: challenges; negative IDs: shared context>>
         +store_context()
         +get_context()
         +append_context()

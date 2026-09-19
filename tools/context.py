@@ -12,9 +12,9 @@ CONTEXT_DB_PATH = (
 
 
 def _validate_challenge_id(chal_ID: int) -> int:
-    """Return a valid challenge ID or raise a useful error."""
-    if isinstance(chal_ID, bool) or not isinstance(chal_ID, int) or chal_ID < 0:
-        raise ValueError("chal_ID must be a non-negative integer")
+    """Return an integer challenge ID, including negative shared-context IDs."""
+    if isinstance(chal_ID, bool) or not isinstance(chal_ID, int):
+        raise ValueError("chal_ID must be an integer")
     return chal_ID
 
 
@@ -26,6 +26,7 @@ def _connect() -> sqlite3.Connection:
         """
         CREATE TABLE IF NOT EXISTS challenge_contexts (
             challenge_id INTEGER PRIMARY KEY,
+            name TEXT,
             context TEXT NOT NULL,
             filepath TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -57,6 +58,24 @@ def store_context(context: str, chal_ID: int) -> None:
                 updated_at = CURRENT_TIMESTAMP
             """,
             (challenge_id, text),
+        )
+
+
+def store_name(name: str, chal_ID: int) -> None:
+    """Store or replace the challenge name for a context record."""
+    challenge_id = _validate_challenge_id(chal_ID)
+    if not isinstance(name, str) or not name.strip():
+        raise ValueError("name must be a non-empty string")
+    with _connect() as connection:
+        connection.execute(
+            """
+            INSERT INTO challenge_contexts (challenge_id, context, name)
+            VALUES (?, '', ?)
+            ON CONFLICT(challenge_id) DO UPDATE SET
+                name = excluded.name,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (challenge_id, name),
         )
 
 

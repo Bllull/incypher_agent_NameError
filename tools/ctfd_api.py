@@ -20,11 +20,15 @@ CHALLENGE_DOWNLOAD_DIR = (
 )
 
 
-def extract_challenge_description(challenge_id: int) -> str:
-    """Return the Markdown value at CTFd's ``data.description`` field."""
+def extract_challenge_description(challenge_id: int) -> tuple[str, str]:
+    """Return the challenge name and Markdown description from CTFd details."""
     details = get_challenge_details(challenge_id)
+    name = details.get("name", "")
     description = details.get("description", "")
-    return description.strip() if isinstance(description, str) else ""
+    return (
+        name.strip() if isinstance(name, str) else "",
+        description.strip() if isinstance(description, str) else "",
+    )
 
 
 def identify_challenge_type(challenge_id: int) -> Literal["file", "url", "tcp"]:

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from tools.context import append_context, store_chal_file_path, store_context
+from tools.context import append_context, store_chal_file_path, store_context, store_name
 from tools.ctfd_api import (
     download_challenge_files,
     extract_challenge_description,
@@ -52,7 +52,10 @@ def main() -> None:
             continue
 
         try:
-            description = extract_challenge_description(chal_ID)
+            retrieved_name, description = extract_challenge_description(chal_ID)
+            if retrieved_name:
+                challenge_name = retrieved_name
+            store_name(challenge_name, chal_ID)
             store_context(description, chal_ID)
             challenge_kind = identify_challenge_type(chal_ID)
             challenge_type = {"url": "web", "tcp": "port", "file": "file"}.get(

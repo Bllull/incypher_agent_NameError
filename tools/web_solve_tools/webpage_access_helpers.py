@@ -9,13 +9,9 @@ from urllib.parse import urljoin
 
 import requests
 
-from tools.context import update_context
 from tools.http_client import create_session, interact_http
+from tools.web_solve_tools.web_context import store_form_schema
 
-
-# Form schemas are workflow data, not challenge metadata. Keep them in the
-# reserved shared context record instead of appending to a challenge record.
-WEB_CONTEXT_ID = -1000
 _FLAG_PATTERN = re.compile(r"INCYPHER\{[^\r\n}]+\}")
 
 
@@ -80,7 +76,7 @@ class _FormParser(HTMLParser):
 
 def _validated_schema_from_context(context: dict[str, Any] | None) -> dict[str, Any] | None:
     """Return the most recently stored validated schema from context."""
-    value = context.get("validated_form_schema") if context else None
+    value = context.get("form_schema") if context else None
     return value if isinstance(value, dict) and isinstance(value.get("fields"), dict) else None
 
 
@@ -110,7 +106,7 @@ def get_form_json(
         raise ValueError(f"Discovered form at {challenge_url} failed validation")
     if chal_ID is not None:
         print(f"[web] Caching validated form schema for {challenge_url}")
-        append_validated_form_context(chal_ID, schema)
+        store_form_schema(chal_ID, schema)
     return schema
 
 
@@ -148,7 +144,6 @@ def submit_form(
             data=fields if method == "POST" else None,
         )
         print(f"[web] form response: status={response.status_code} url={response.url}")
-        print(response.text)
         responses.append(response)
     return responses if isinstance(values, list) else responses[0]
 
@@ -187,16 +182,6 @@ def validate_form_json(
     valid = 200 <= response.status_code < 400
     print(f"[web] form validation: {'passed' if valid else 'failed'}")
     return valid
-
-
-def append_validated_form_context(chal_ID: int, form_schema: dict[str, Any]) -> None:
-    """Append a labelled validated schema to the reserved web context record.
-
-    ``chal_ID`` remains part of the helper's interface for callers that already
-    provide it, but web-specific data is intentionally never stored under that
-    challenge ID.
-    """
-    update_context({"validated_form_schema": form_schema}, WEB_CONTEXT_ID)
 
 
 def extract_flag(text: str) -> str | None:

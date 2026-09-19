@@ -3,24 +3,26 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
 
 import requests
 
-from tools.context import get_chal_file_path, get_context, update_context
+from tools.context import get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
 from tools.http_client import create_session
 from tools.llm_router import call_openai
 from tools.web_solve_tools.webpage_access_helpers import extract_flag, get_form_json, submit_form
+from tools.web_solve_tools.web_context import (
+    append_web_node,
+    get_web_context,
+    pruned_web_context,
+    reset_web_context,
+    upsert_web_node,
+)
 
 
 WEB_CHALLENGE_SUBTYPES = ("SSTI",)
-# Temporary compatibility probes. The solver accepts a runtime probe list so
-# a later LLM iteration can supply these without changing the submit/store
-# workflow.
-DEFAULT_SSTI_PROBES = ("{{7*7}}", "${7*7}", "<%= 7*7 %>")
-# Reserved context record for data produced by the web-solving workflow.
-WEB_CONTEXT_ID = -1000
+MAX_SSTI_ITERATIONS = 20
+MAX_SSTI_TESTS_PER_ITERATION = 10
 
 
 def identify_web_subtype(chal_ID: int) -> str:
@@ -31,7 +33,7 @@ def identify_web_subtype(chal_ID: int) -> str:
     dispatcher to grow with additional subtype-specific workflows later.
     """
     challenge_context = get_context(chal_ID) or {}
-    web_context = get_context(WEB_CONTEXT_ID) or {}
+    web_context = pruned_web_context(chal_ID)
     prompt = f"""You are classifying a web CTF challenge for a workflow dispatcher.
 
 Read the challenge context below and identify its subtype. The only currently
@@ -58,19 +60,82 @@ Previously collected web workflow context:
     return match or "UNKNOWN"
 
 
-def _solve_ssti(
-    chal_ID: int,
-) -> str | None:
-    """Submit supplied SSTI probes and retain the response list.
+def _parse_ssti_plan(raw_plan: str, form_fields: dict[str, object]) -> dict[str, object]:
+    """Parse and validate one machine-readable LLM test plan."""
+    cleaned = raw_plan.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    plan = json.loads(cleaned)
+    if not isinstance(plan, dict):
+        raise ValueError("SSTI LLM plan must be a JSON object")
 
-    Probe selection belongs inside this subtype workflow. The current default
-    keeps the existing behavior until the LLM probe-selection step is added.
-    """
-    # Replace this local selection with the future LLM interaction. Keeping it
-    # here ensures the dispatcher remains independent of SSTI details.
-    probes = DEFAULT_SSTI_PROBES
+    inference = plan.get("inference", "")
+    tests = plan.get("field_vars_to_test", [])
+    next_steps = plan.get("subsequent_steps", [])
+    if not isinstance(inference, str):
+        raise ValueError("SSTI plan inference must be a string")
+    if not isinstance(tests, list) or not all(isinstance(test, dict) for test in tests):
+        raise ValueError("SSTI plan field_vars_to_test must be a list of objects")
+    if not isinstance(next_steps, list) or not all(isinstance(step, str) for step in next_steps):
+        raise ValueError("SSTI plan subsequent_steps must be a list of strings")
 
-    web_context = get_context(WEB_CONTEXT_ID) or {}
+    normalized_tests: list[dict[str, object]] = []
+    for test in tests:
+        field = test.get("field")
+        if not isinstance(field, str) or field not in form_fields:
+            raise ValueError(f"SSTI plan references unknown form field: {field!r}")
+        if "value" not in test:
+            raise ValueError(f"SSTI plan has no value for field: {field}")
+        normalized_tests.append({"field": field, "value": test["value"]})
+    return {
+        "inference": inference,
+        "field_vars_to_test": normalized_tests,
+        "subsequent_steps": next_steps,
+    }
+
+
+def _ask_for_ssti_plan(chal_ID: int, form_schema: dict[str, object]) -> dict[str, object]:
+    """Ask the LLM for the next field/value tests from a pruned branch."""
+    challenge_context = get_context(chal_ID) or {}
+    workflow_context = pruned_web_context(chal_ID)
+    prompt = f"""You are iteratively solving a web CTF challenge.
+
+Use the challenge context, form schema, and compact active reasoning branch to
+choose the next field/value submissions to test. Use observed evidence as the
+foundation, but allow clearly labeled hypotheses when evidence is incomplete.
+Distinguish confirmed observations from speculative inferences. Prefer tests
+that distinguish competing hypotheses or maximize information gained. Do not
+repeat tests already present in the branch unless there is a clear reason.
+
+Return JSON only, with exactly this shape:
+{{
+  "inference": "short evidence-based inference",
+  "field_vars_to_test": [{{"field": "field_name", "value": "value_to_submit"}}],
+  "subsequent_steps": ["short next-step idea"]
+}}
+
+The values must be form field names from the schema. Keep the inference and
+steps concise; state whether the inference is confirmed or hypothetical. Do
+not include hidden chain-of-thought.
+
+Challenge context:
+{json.dumps(challenge_context, sort_keys=True)}
+
+Form schema:
+{json.dumps(form_schema, sort_keys=True)}
+
+Pruned workflow context:
+{json.dumps(workflow_context, sort_keys=True)}
+"""
+    return _parse_ssti_plan(
+        call_openai(prompt, require_deep_reasoning=True),
+        form_schema.get("fields", {}),
+    )
+
+
+def _solve_ssti(chal_ID: int) -> str | None:
+    """Iteratively choose, submit, and record SSTI field/value tests."""
+    web_context = get_web_context(chal_ID)
     challenge_url = get_challenge_url(chal_ID)
     session = create_session()
     form_schema = get_form_json(
@@ -84,34 +149,85 @@ def _solve_ssti(
     if not isinstance(fields, dict) or not fields:
         raise ValueError("The validated SSTI form contains no fields")
 
-    overrides = [
-        {field_name: probe}
-        for field_name in fields
-        for probe in probes
-    ]
-    responses = submit_form(form_schema, values=overrides, session=session)
-    if not isinstance(responses, list):
-        raise TypeError("Repeated SSTI submission did not return response list")
+    for iteration in range(1, MAX_SSTI_ITERATIONS + 1):
+        plan = _ask_for_ssti_plan(chal_ID, form_schema)
+        tests = plan["field_vars_to_test"]
+        assert isinstance(tests, list)
+        if len(tests) > MAX_SSTI_TESTS_PER_ITERATION:
+            print(
+                f"[web][SSTI] Iteration {iteration} suggested {len(tests)} tests; "
+                f"capping at {MAX_SSTI_TESTS_PER_ITERATION}."
+            )
+            tests = tests[:MAX_SSTI_TESTS_PER_ITERATION]
+            plan["field_vars_to_test"] = tests
+        branch = pruned_web_context(chal_ID)["active_branch"]
+        branch_summary = [
+            {
+                "id": node.get("id"),
+                "inference": node.get("inference"),
+                "status": node.get("status"),
+            }
+            for node in branch
+        ]
+        print(f"[web][SSTI] Iteration {iteration} reasoning branch:")
+        print(json.dumps(branch_summary, sort_keys=True))
+        print(f"[web][SSTI] Iteration {iteration} test logic: {plan['inference']}")
+        print(
+            f"[web][SSTI] Iteration {iteration} subsequent steps: "
+            f"{json.dumps(plan['subsequent_steps'], sort_keys=True)}"
+        )
+        print(
+            f"[web][SSTI] Iteration {iteration} input test fields: "
+            f"{json.dumps(tests, sort_keys=True)}"
+        )
+        overrides = [{test["field"]: test["value"]} for test in tests]
+        if not overrides:
+            append_web_node(
+                chal_ID,
+                parent_id=get_web_context(chal_ID)["active_node_id"],
+                inference=str(plan["inference"]),
+                field_vars_to_test=tests,
+                responses=[],
+                subsequent_steps=plan["subsequent_steps"],
+                status="stalled",
+            )
+            return None
 
-    response_records = [
-        {
-            "field": payload,
-            "status_code": response.status_code,
-            "url": response.url,
-            "text": response.text[:4000],
-        }
-        for payload, response in zip(overrides, responses)
-    ]
-    update_context({"ssti_responses": response_records}, WEB_CONTEXT_ID)
-    for response in responses:
-        flag = extract_flag(response.text)
+        responses = submit_form(form_schema, values=overrides, session=session)
+        if not isinstance(responses, list):
+            raise TypeError("Repeated SSTI submission did not return response list")
+
+        response_records = [
+            {
+                "field": payload,
+                "status_code": response.status_code,
+                "url": response.url,
+                "text": response.text[:4000],
+            }
+            for payload, response in zip(overrides, responses)
+        ]
+        flag = next((extract_flag(response.text) for response in responses), None)
+        append_web_node(
+            chal_ID,
+            parent_id=get_web_context(chal_ID)["active_node_id"],
+            inference=str(plan["inference"]),
+            field_vars_to_test=tests,
+            responses=response_records,
+            subsequent_steps=plan["subsequent_steps"],
+            status="flag_found" if flag else "active",
+        )
         if flag:
             return flag
+    final_context = get_web_context(chal_ID)
+    final_node = final_context["nodes"][final_context["active_node_id"]]
+    final_node["status"] = "iteration_limit"
+    upsert_web_node(chal_ID, final_node)
     return None
 
 
 def web_chal_solver(chal_ID: int) -> str | None:
     """Classify a web challenge, then dispatch to its subtype workflow."""
+    reset_web_context(chal_ID)
     context = get_context(chal_ID)
     print(f"[web] Challenge {chal_ID} context: {context!r}")
     print(f"[web] Challenge {chal_ID} file path: {get_chal_file_path(chal_ID)!r}")
@@ -127,8 +243,8 @@ def web_chal_solver(chal_ID: int) -> str | None:
         print(f"[web] Challenge {chal_ID} form workflow failed: {exc}")
     return None   
 
-# def main():
-#     web_chal_solver(19)
+def main():
+    web_chal_solver(19)
 
-# if __name__ == "__main__":
-#     main()
+if __name__ == "__main__":
+    main()

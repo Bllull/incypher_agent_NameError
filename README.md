@@ -42,24 +42,33 @@ docker run --rm -it `
 ```mermaid
 classDiagram
     class agent_py {
+        +_delegate(challenge_type, chal_ID) str | None
         +main()
     }
     class ctfd_api_py {
         +get_challenges()
         +get_challenge_details()
+        +identify_challenge_type()
         +extract_challenge_description()
         +download_challenge_files()
+        +connect_challenge_url()
+        +connect_challenge_tcp()
     }
     class preflight_py {
         +main()
         +check_soclaas_connection()
+        +check_challenge_url_connection()
+        +check_challenge_tcp_connection()
         +check_challenge_description_retrieval()
         +check_challenge_file_download()
+        +check_context_sqlite_connection()
     }
     class context_py {
         +store_context()
         +get_context()
         +append_context()
+        +store_chal_file_path()
+        +get_chal_file_path()
     }
     class config_py {
         +load_dotenv()
@@ -67,22 +76,41 @@ classDiagram
     class llm_router_py {
         +call_openai()
     }
-    class web_chal_py
-    class port_chal_py
-    class file_chal_py
+    class web_chal_py {
+        +web_chal_solver(chal_ID) str | None
+    }
+    class port_chal_py {
+        +port_chal_solver(chal_ID) str | None
+    }
+    class file_chal_py {
+        +file_chal_solver(chal_ID) str | None
+    }
     class tcp_client_py {
         +interact_tcp()
+    }
+    class http_client_py {
+        +create_session()
+        +interact_http()
     }
     class solver_py {
         +connect()
     }
 
     agent_py --> ctfd_api_py : retrieves challenge data
+    agent_py --> web_chal_py : delegates URL challenge
+    agent_py --> port_chal_py : delegates TCP challenge
+    agent_py --> file_chal_py : delegates file challenge
+    web_chal_py --> agent_py : str flag (solved) or None (retry)
+    port_chal_py --> agent_py : str flag (solved) or None (retry)
+    file_chal_py --> agent_py : str flag (solved) or None (retry)
     preflight_py --> ctfd_api_py : verifies API data
+    preflight_py --> context_py : verifies SQLite storage
     ctfd_api_py --> config_py : loads credentials
     llm_router_py --> config_py : loads credentials
     tcp_client_py --> solver_py : opens TCP connection
     web_chal_py --> context_py : planned context use
+    web_chal_py --> http_client_py : planned HTTP use
     port_chal_py --> context_py : planned context use
+    port_chal_py --> tcp_client_py : planned TCP use
     file_chal_py --> context_py : planned context use
 ```

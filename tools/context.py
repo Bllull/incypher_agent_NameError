@@ -108,6 +108,16 @@ def update_context(context: Context, chal_ID: int) -> None:
         )
 
 
+def delete_context(chal_ID: int) -> None:
+    """Delete the complete JSON context for one challenge ID, if it exists."""
+    challenge_id = _validate_challenge_id(chal_ID)
+    with _connect() as connection:
+        connection.execute(
+            "DELETE FROM challenge_contexts WHERE challenge_id = ?",
+            (challenge_id,),
+        )
+
+
 def store_name(name: str, chal_ID: int) -> None:
     """Store the challenge name under the JSON ``name`` field."""
     if not isinstance(name, str) or not name.strip():

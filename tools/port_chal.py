@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 from tools.context import append_context, get_context
@@ -16,6 +17,11 @@ def _find_flag(text: str) -> str | None:
     """Return the first flag-shaped value sent by the challenge service."""
     match = _FLAG_PATTERN.search(text)
     return match.group(0) if match else None
+
+
+def _append_attempt(chal_ID: int, **attempt: str | int) -> None:
+    """Store one port-solver attempt as a JSON document in challenge context."""
+    append_context(json.dumps(attempt, ensure_ascii=False), chal_ID)
 
 
 def port_chal_solver(chal_ID: int) -> str | None:
@@ -45,7 +51,7 @@ def port_chal_solver(chal_ID: int) -> str | None:
         )
         commands = commands.strip()
         if not commands:
-            append_context("Port solve attempt produced no command.", chal_ID)
+            _append_attempt(chal_ID, event="no_command")
             return None
 
         challenge_connection.sendall((commands + "\n").encode())
@@ -54,16 +60,16 @@ def port_chal_solver(chal_ID: int) -> str | None:
         if flag:
             return flag
 
-        append_context(
-            "Port solve attempt failed.\n"
-            f"Opening response:\n{opening_response}\n"
-            f"Command sent:\n{commands}\n"
-            f"Response:\n{response}",
+        _append_attempt(
             chal_ID,
+            event="unsolved",
+            opening_response=opening_response,
+            commands=commands,
+            response=response,
         )
         return None
     except Exception as exc:
-        append_context(f"Port solve attempt error: {exc}", chal_ID)
+        _append_attempt(chal_ID, event="error", error=str(exc))
         print(f"[port] Challenge {chal_ID} could not be solved: {exc}")
         return None
     finally:

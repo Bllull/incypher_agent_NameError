@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import time
 
-from tools.context import append_context, store_chal_file_path, store_context, store_name
+from tools.context import store_chal_file_path, store_context, store_name, update_context
 from tools.ctfd_api import (
     download_challenge_files,
     extract_challenge_description,
@@ -56,7 +56,7 @@ def main() -> None:
             if retrieved_name:
                 challenge_name = retrieved_name
             store_name(challenge_name, chal_ID)
-            store_context(description, chal_ID)
+            store_context({"description": description}, chal_ID)
             challenge_kind = identify_challenge_type(chal_ID)
             challenge_type = {"url": "web", "tcp": "port", "file": "file"}.get(
                 challenge_kind
@@ -69,10 +69,7 @@ def main() -> None:
                 if file_paths:
                     store_chal_file_path(file_paths[0], chal_ID)
                     if len(file_paths) > 1:
-                        append_context(
-                            "Additional downloaded files:\n" + "\n".join(file_paths[1:]),
-                            chal_ID,
-                        )
+                        update_context({"additional_file_paths": file_paths[1:]}, chal_ID)
 
             print(f"[*] Delegating [{chal_ID}] {challenge_name} as {challenge_type}.")
             if not _delegate(challenge_type, chal_ID):

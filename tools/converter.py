@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import shutil
+import stat
+import zipfile
 from pathlib import Path
+from pathlib import PurePosixPath
 from typing import Literal
 
 import matplotlib
 import numpy as np
 import soundfile as sf
 
+from tools.context import get_context, update_context
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -49,16 +54,40 @@ def _spectrogram_nfft(sample_count: int) -> int:
     return 2 ** int(np.floor(np.log2(min(1024, sample_count))))
 
 
+def _store_converted_files(output_paths: list[Path], chal_ID: int) -> None:
+    """Add generated file paths to a challenge's JSON context."""
+    context = get_context(chal_ID) or {}
+    existing_paths = context.get("converted_file_paths", [])
+    if not isinstance(existing_paths, list) or not all(
+        isinstance(path, str) for path in existing_paths
+    ):
+        existing_paths = []
+
+    for output_path in output_paths:
+        resolved_path = str(output_path.resolve())
+        if resolved_path not in existing_paths:
+            existing_paths.append(resolved_path)
+    update_context({"converted_file_paths": existing_paths}, chal_ID)
+
+
+def _store_converted_file(output_path: Path, chal_ID: int) -> None:
+    """Add one generated file path to a challenge's JSON context."""
+    _store_converted_files([output_path], chal_ID)
+
+
 def convert_audio_file(
     audio_path: str | Path,
     conversion_type: AudioConversionType,
     output_path: str | Path | None = None,
+    *,
+    chal_ID: int,
 ) -> Path:
     """Convert audio to a PNG spectrogram (``1``) or waveform (``2``).
 
     The source format must be readable by SoundFile. When ``output_path`` is
     omitted, the PNG is written beside the audio file with a descriptive name.
-    The returned path is absolute.
+    The returned absolute path is added to ``converted_file_paths`` in the
+    challenge's JSON context.
     """
     source = Path(audio_path)
     if not source.is_file():
@@ -92,4 +121,85 @@ def convert_audio_file(
     finally:
         plt.close(figure)
 
-    return destination.resolve()
+    resolved_destination = destination.resolve()
+    _store_converted_file(resolved_destination, chal_ID)
+    return resolved_destination
+
+
+def extract_zip_archive(
+    archive_path: str | Path,
+    *,
+    chal_ID: int,
+    output_directory: str | Path | None = None,
+    max_files: int = 1000,
+    max_total_size: int = 512 * 1024 * 1024,
+) -> list[Path]:
+    """Safely extract a ZIP archive and record all output files in context.
+
+    The default output directory is ``<archive_name>_extracted`` beside the
+    archive. Absolute paths, parent-directory traversal, symbolic links,
+    excessive file counts, and excessive uncompressed sizes are rejected.
+    Existing output files are never overwritten.
+    """
+    source = Path(archive_path)
+    if not source.is_file():
+        raise FileNotFoundError(f"ZIP archive does not exist: {source}")
+    if not zipfile.is_zipfile(source):
+        raise ValueError(f"File is not a valid ZIP archive: {source}")
+    if max_files < 1 or max_total_size < 1:
+        raise ValueError("ZIP extraction limits must be positive")
+
+    destination = (
+        Path(output_directory)
+        if output_directory is not None
+        else source.with_name(f"{source.stem}_extracted")
+    ).resolve()
+
+    extracted_files: list[Path] = []
+    with zipfile.ZipFile(source) as archive:
+        members = archive.infolist()
+        file_members = [member for member in members if not member.is_dir()]
+        if len(file_members) > max_files:
+            raise ValueError(f"ZIP archive exceeds the {max_files}-file limit")
+        if sum(member.file_size for member in file_members) > max_total_size:
+            raise ValueError(
+                f"ZIP archive exceeds the {max_total_size}-byte extraction limit"
+            )
+
+        planned_outputs: list[tuple[zipfile.ZipInfo, Path]] = []
+        planned_targets: set[Path] = set()
+        for member in members:
+            normalized_name = member.filename.replace("\\", "/")
+            relative_path = PurePosixPath(normalized_name)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError(f"Unsafe ZIP member path: {member.filename}")
+            if not relative_path.parts:
+                continue
+            if member.flag_bits & 0x1:
+                raise ValueError(f"Encrypted ZIP members are not supported: {member.filename}")
+            if stat.S_ISLNK(member.external_attr >> 16):
+                raise ValueError(f"ZIP symbolic links are not supported: {member.filename}")
+
+            target = destination.joinpath(*relative_path.parts).resolve()
+            try:
+                target.relative_to(destination)
+            except ValueError as exc:
+                raise ValueError(f"Unsafe ZIP member path: {member.filename}") from exc
+            if target in planned_targets:
+                raise ValueError(f"Duplicate ZIP output path: {member.filename}")
+            if not member.is_dir() and target.exists():
+                raise FileExistsError(f"ZIP output already exists: {target}")
+            planned_targets.add(target)
+            planned_outputs.append((member, target))
+
+        for member, target in planned_outputs:
+            if member.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with archive.open(member) as source_file, target.open("xb") as output_file:
+                shutil.copyfileobj(source_file, output_file)
+            extracted_files.append(target)
+
+    _store_converted_files(extracted_files, chal_ID)
+    return extracted_files

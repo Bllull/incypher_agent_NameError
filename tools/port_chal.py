@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 
-from tools.context import append_context, get_context
+from tools.context import get_context, update_context
 from tools.ctfd_api import connect_challenge_tcp
 from tools.llm_router import call_openai
 
@@ -20,8 +20,13 @@ def _find_flag(text: str) -> str | None:
 
 
 def _append_attempt(chal_ID: int, **attempt: str | int) -> None:
-    """Store one port-solver attempt as a JSON document in challenge context."""
-    append_context(json.dumps(attempt, ensure_ascii=False), chal_ID)
+    """Append one port-solver attempt to the JSON ``port_attempts`` field."""
+    context = get_context(chal_ID) or {}
+    attempts = context.get("port_attempts", [])
+    if not isinstance(attempts, list):
+        attempts = []
+    attempts.append(attempt)
+    update_context({"port_attempts": attempts}, chal_ID)
 
 
 def port_chal_solver(chal_ID: int) -> str | None:
@@ -30,7 +35,7 @@ def port_chal_solver(chal_ID: int) -> str | None:
     The complete TCP transcript is retained in challenge context when no flag is
     found, so the next invocation can ask the model to improve on this attempt.
     """
-    context = get_context(chal_ID) or ""
+    context = get_context(chal_ID) or {}
     challenge_connection = None
 
     try:
@@ -46,7 +51,7 @@ def port_chal_solver(chal_ID: int) -> str | None:
             "and the service's opening response, produce the command or input to "
             "send next. Return only the exact input, with no Markdown or explanation.\n\n"
             f"Challenge ID: {chal_ID}\n"
-            f"Challenge context:\n{context}\n\n"
+            f"Challenge context:\n{json.dumps(context, ensure_ascii=False, sort_keys=True)}\n\n"
             f"Service opening response:\n{opening_response}"
         )
         commands = commands.strip()

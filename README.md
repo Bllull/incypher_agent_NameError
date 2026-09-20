@@ -85,7 +85,8 @@ classDiagram
         +call_multimodal_openai(prompt, image_paths, model_name)
     }
     class converter_py {
-        +convert_audio_file(audio_path, conversion_type, output_path) Path
+        +convert_audio_file(audio_path, conversion_type, output_path, chal_ID) Path
+        +extract_zip_archive(archive_path, chal_ID, output_directory) list~Path~
     }
     class web_chal_py {
         +web_chal_solver(chal_ID) str | None
@@ -136,4 +137,5 @@ classDiagram
     port_chal_py --> tcp_client_py : planned TCP use
     file_chal_py --> context_py : reads challenge context
     converter_py --> llm_router_py : produces image-compatible audio views
+    converter_py --> context_py : records converted file paths
 ```

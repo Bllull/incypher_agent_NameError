@@ -62,11 +62,17 @@ All context records are JSON dictionaries stored in the local SQLite database.
 
 ### `tools/converter.py`
 
-- `convert_audio_file(audio_path, conversion_type, output_path=None)` converts
-  a SoundFile-readable mono or stereo audio file into a PNG. Stereo input is
-  down-mixed to mono. Use `1` for a spectrogram or `2` for a waveform. With no
-  destination supplied, it writes a descriptive PNG beside the source audio
-  and returns its absolute path.
+- `convert_audio_file(audio_path, conversion_type, output_path=None, *,
+  chal_ID)` converts a SoundFile-readable mono or stereo audio file into a PNG.
+  Stereo input is down-mixed to mono. Use `1` for a spectrogram or `2` for a
+  waveform. With no destination supplied, it writes a descriptive PNG beside
+  the source audio, records its absolute path in `converted_file_paths` in the
+  supplied challenge context, and returns that path.
+- `extract_zip_archive(archive_path, *, chal_ID, output_directory=None)` safely
+  extracts a ZIP archive and records every extracted file in
+  `converted_file_paths`. It rejects path traversal, symbolic links, more than
+  1,000 files, more than 512 MiB of uncompressed content, and existing output
+  files that would otherwise be overwritten.
 
 ## Web challenge workflow
 

@@ -9,20 +9,25 @@ import requests
 from tools.context import get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
 from tools.http_client import create_session
-from tools.llm_router import call_openai
+from tools.web_solve_tools.web_llm import call_web_llm
 from tools.web_solve_tools.webpage_access_helpers import extract_flag, get_form_json, submit_form
 from tools.web_solve_tools.web_context import (
     append_web_node,
+    attempted_test_keys,
     get_web_context,
+    has_recent_evidence_stall,
     pruned_web_context,
     reset_web_context,
     upsert_web_node,
 )
+from tools.web_solve_tools.ssti_evidence import analyze_ssti_response
 
 
 WEB_CHALLENGE_SUBTYPES = ("SSTI",)
+SSTI_PHASES = ("discovery", "confirmation", "filter_mapping", "capability_mapping", "retrieval")
 MAX_SSTI_ITERATIONS = 20
 MAX_SSTI_TESTS_PER_ITERATION = 10
+MAX_SSTI_NO_PROGRESS_ITERATIONS = 3
 
 
 def identify_web_subtype(chal_ID: int) -> str:
@@ -49,7 +54,7 @@ Previously collected web workflow context:
 {json.dumps(web_context, sort_keys=True)}
 """
     try:
-        answer = call_openai(prompt).strip().upper()
+        answer = call_web_llm(prompt).strip().upper()
     except Exception as exc:
         print(f"[web] Challenge {chal_ID} subtype classification failed: {exc}")
         return "UNKNOWN"
@@ -69,15 +74,19 @@ def _parse_ssti_plan(raw_plan: str, form_fields: dict[str, object]) -> dict[str,
     if not isinstance(plan, dict):
         raise ValueError("SSTI LLM plan must be a JSON object")
 
-    inference = plan.get("inference", "")
-    tests = plan.get("field_vars_to_test", [])
-    next_steps = plan.get("subsequent_steps", [])
-    if not isinstance(inference, str):
-        raise ValueError("SSTI plan inference must be a string")
+    phase = plan.get("phase")
+    hypothesis = plan.get("hypothesis", "")
+    tests = plan.get("tests", [])
+    advance_when = plan.get("advance_when", "")
+    fallback = plan.get("fallback", "")
+    if phase not in SSTI_PHASES:
+        raise ValueError(f"SSTI plan phase must be one of {SSTI_PHASES}")
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError("SSTI plan hypothesis must be a non-empty string")
     if not isinstance(tests, list) or not all(isinstance(test, dict) for test in tests):
-        raise ValueError("SSTI plan field_vars_to_test must be a list of objects")
-    if not isinstance(next_steps, list) or not all(isinstance(step, str) for step in next_steps):
-        raise ValueError("SSTI plan subsequent_steps must be a list of strings")
+        raise ValueError("SSTI plan tests must be a list of objects")
+    if not isinstance(advance_when, str) or not isinstance(fallback, str):
+        raise ValueError("SSTI plan advance_when and fallback must be strings")
 
     normalized_tests: list[dict[str, object]] = []
     for test in tests:
@@ -86,11 +95,30 @@ def _parse_ssti_plan(raw_plan: str, form_fields: dict[str, object]) -> dict[str,
             raise ValueError(f"SSTI plan references unknown form field: {field!r}")
         if "value" not in test:
             raise ValueError(f"SSTI plan has no value for field: {field}")
-        normalized_tests.append({"field": field, "value": test["value"]})
+        purpose = test.get("purpose", "")
+        expected_signals = test.get("expected_signals", [])
+        expected_output = test.get("expected_output")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise ValueError(f"SSTI plan test purpose must be a non-empty string: {field}")
+        if not isinstance(expected_signals, list) or not all(isinstance(signal, str) for signal in expected_signals):
+            raise ValueError(f"SSTI plan expected_signals must be a list of strings: {field}")
+        if expected_output is not None and not isinstance(expected_output, str):
+            raise ValueError(f"SSTI plan expected_output must be a string when supplied: {field}")
+        normalized_tests.append(
+            {
+                "field": field,
+                "value": test["value"],
+                "purpose": purpose,
+                "expected_signals": expected_signals,
+                "expected_output": expected_output,
+            }
+        )
     return {
-        "inference": inference,
-        "field_vars_to_test": normalized_tests,
-        "subsequent_steps": next_steps,
+        "phase": phase,
+        "hypothesis": hypothesis,
+        "tests": normalized_tests,
+        "advance_when": advance_when,
+        "fallback": fallback,
     }
 
 
@@ -100,23 +128,35 @@ def _ask_for_ssti_plan(chal_ID: int, form_schema: dict[str, object]) -> dict[str
     workflow_context = pruned_web_context(chal_ID)
     prompt = f"""You are iteratively solving a web CTF challenge.
 
-Use the challenge context, form schema, and compact active reasoning branch to
-choose the next field/value submissions to test. Use observed evidence as the
-foundation, but allow clearly labeled hypotheses when evidence is incomplete.
-Distinguish confirmed observations from speculative inferences. Prefer tests
-that distinguish competing hypotheses or maximize information gained. Do not
-repeat tests already present in the branch unless there is a clear reason.
+Use the challenge context, form schema, and recorded observations to choose
+the next smallest set of experiments. Treat observations as facts and every
+other claim as a hypothesis. Do not assume a template engine, programming
+language semantics, filter mechanism, exposed capability, or flag location.
+
+Choose one evidence-gated phase: discovery (locate possible evaluation),
+confirmation (verify an observed effect), filter_mapping (isolate one input
+constraint at a time), capability_mapping (learn only capabilities supported
+by evidence), or retrieval (only when evidence supports a target). Prefer
+tests that distinguish hypotheses. A rejection response can be useful evidence;
+do not repeat an already submitted field/value pair.
 
 Return JSON only, with exactly this shape:
 {{
-  "inference": "short evidence-based inference",
-  "field_vars_to_test": [{{"field": "field_name", "value": "value_to_submit"}}],
-  "subsequent_steps": ["short next-step idea"]
+  "phase": "one allowed phase",
+  "hypothesis": "short evidence-based hypothesis",
+  "tests": [{{
+    "field": "field_name",
+    "value": "value_to_submit",
+    "purpose": "what this distinguishes",
+    "expected_signals": ["observable result categories"],
+    "expected_output": "optional literal output expected from a harmless probe"
+  }}],
+  "advance_when": "observable condition for changing phase",
+  "fallback": "next action if the condition is absent"
 }}
 
-The values must be form field names from the schema. Keep the inference and
-steps concise; state whether the inference is confirmed or hypothetical. Do
-not include hidden chain-of-thought.
+The field values must use form field names from the schema. Keep all text
+concise. Do not include hidden chain-of-thought or a fixed exploit recipe.
 
 Challenge context:
 {json.dumps(challenge_context, sort_keys=True)}
@@ -128,7 +168,7 @@ Pruned workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
     return _parse_ssti_plan(
-        call_openai(prompt, require_deep_reasoning=True),
+        call_web_llm(prompt, require_deep_reasoning=True),
         form_schema.get("fields", {}),
     )
 
@@ -151,15 +191,21 @@ def _solve_ssti(chal_ID: int) -> str | None:
 
     for iteration in range(1, MAX_SSTI_ITERATIONS + 1):
         plan = _ask_for_ssti_plan(chal_ID, form_schema)
-        tests = plan["field_vars_to_test"]
+        tests = plan["tests"]
         assert isinstance(tests, list)
+        attempted = attempted_test_keys(chal_ID)
+        tests = [
+            test for test in tests
+            if json.dumps([test.get("field"), test.get("value")], sort_keys=True) not in attempted
+        ]
+        plan["tests"] = tests
         if len(tests) > MAX_SSTI_TESTS_PER_ITERATION:
             print(
                 f"[web][SSTI] Iteration {iteration} suggested {len(tests)} tests; "
                 f"capping at {MAX_SSTI_TESTS_PER_ITERATION}."
             )
             tests = tests[:MAX_SSTI_TESTS_PER_ITERATION]
-            plan["field_vars_to_test"] = tests
+            plan["tests"] = tests
         branch = pruned_web_context(chal_ID)["active_branch"]
         branch_summary = [
             {
@@ -171,10 +217,10 @@ def _solve_ssti(chal_ID: int) -> str | None:
         ]
         print(f"[web][SSTI] Iteration {iteration} reasoning branch:")
         print(json.dumps(branch_summary, sort_keys=True))
-        print(f"[web][SSTI] Iteration {iteration} test logic: {plan['inference']}")
+        print(f"[web][SSTI] Iteration {iteration} phase: {plan['phase']}")
+        print(f"[web][SSTI] Iteration {iteration} hypothesis: {plan['hypothesis']}")
         print(
-            f"[web][SSTI] Iteration {iteration} subsequent steps: "
-            f"{json.dumps(plan['subsequent_steps'], sort_keys=True)}"
+            f"[web][SSTI] Iteration {iteration} advance condition: {plan['advance_when']}"
         )
         print(
             f"[web][SSTI] Iteration {iteration} input test fields: "
@@ -185,10 +231,11 @@ def _solve_ssti(chal_ID: int) -> str | None:
             append_web_node(
                 chal_ID,
                 parent_id=get_web_context(chal_ID)["active_node_id"],
-                inference=str(plan["inference"]),
+                inference=str(plan["hypothesis"]),
                 field_vars_to_test=tests,
                 responses=[],
-                subsequent_steps=plan["subsequent_steps"],
+                subsequent_steps=[str(plan["fallback"])],
+                phase=str(plan["phase"]),
                 status="stalled",
             )
             return None
@@ -197,27 +244,45 @@ def _solve_ssti(chal_ID: int) -> str | None:
         if not isinstance(responses, list):
             raise TypeError("Repeated SSTI submission did not return response list")
 
-        response_records = [
-            {
-                "field": payload,
-                "status_code": response.status_code,
-                "url": response.url,
-                "text": response.text[:4000],
-            }
-            for payload, response in zip(overrides, responses)
-        ]
+        response_records = []
+        for test, payload, response in zip(tests, overrides, responses):
+            observation = analyze_ssti_response(
+                payload,
+                response.status_code,
+                response.text,
+                expected_output=test.get("expected_output") if isinstance(test.get("expected_output"), str) else None,
+            )
+            response_records.append(
+                {
+                    "field": payload,
+                    "status_code": response.status_code,
+                    "url": response.url,
+                    "text": response.text[:4000],
+                    **observation,
+                }
+            )
         flag = next((extract_flag(response.text) for response in responses), None)
+        evidence = [item for record in response_records for item in record["evidence"]]
         append_web_node(
             chal_ID,
             parent_id=get_web_context(chal_ID)["active_node_id"],
-            inference=str(plan["inference"]),
+            inference=str(plan["hypothesis"]),
             field_vars_to_test=tests,
             responses=response_records,
-            subsequent_steps=plan["subsequent_steps"],
+            subsequent_steps=[str(plan["advance_when"]), str(plan["fallback"])],
+            phase=str(plan["phase"]),
+            evidence=evidence,
             status="flag_found" if flag else "active",
         )
         if flag:
             return flag
+        if has_recent_evidence_stall(chal_ID, MAX_SSTI_NO_PROGRESS_ITERATIONS):
+            print(f"[web][SSTI] Stopping after {MAX_SSTI_NO_PROGRESS_ITERATIONS} no-progress iterations.")
+            stopped_context = get_web_context(chal_ID)
+            stopped_node = stopped_context["nodes"][stopped_context["active_node_id"]]
+            stopped_node["status"] = "no_progress"
+            upsert_web_node(chal_ID, stopped_node)
+            return None
     final_context = get_web_context(chal_ID)
     final_node = final_context["nodes"][final_context["active_node_id"]]
     final_node["status"] = "iteration_limit"

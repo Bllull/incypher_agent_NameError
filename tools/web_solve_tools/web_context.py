@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
+import json
 
 from tools.context import delete_context, get_context, store_context
 
 
 WEB_CONTEXT_ID = -1000
-WEB_CONTEXT_VERSION = 1
+WEB_CONTEXT_VERSION = 2
 
 
 def _initial_context(chal_ID: int) -> dict[str, Any]:
@@ -26,6 +27,9 @@ def _initial_context(chal_ID: int) -> dict[str, Any]:
                 "inference": "Initial web challenge investigation",
                 "field_vars_to_test": [],
                 "responses": [],
+                "phase": "discovery",
+                "evidence": [],
+                "new_evidence": [],
                 "subsequent_steps": [],
                 "status": "active",
             }
@@ -87,6 +91,8 @@ def append_web_node(
     field_vars_to_test: list[dict[str, Any]],
     responses: list[dict[str, Any]],
     subsequent_steps: list[str],
+    phase: str = "discovery",
+    evidence: Iterable[str] = (),
     status: str = "active",
 ) -> str:
     """Append a child reasoning node and return its generated ID."""
@@ -98,6 +104,13 @@ def append_web_node(
     node_id = f"node-{len(nodes)}"
     while node_id in nodes:
         node_id = f"node-{len(nodes) + 1}"
+    previous_evidence = {
+        item
+        for node in nodes.values()
+        for item in node.get("evidence", [])
+        if isinstance(item, str)
+    }
+    node_evidence = list(dict.fromkeys(item for item in evidence if isinstance(item, str)))
     upsert_web_node(
         chal_ID,
         {
@@ -106,6 +119,9 @@ def append_web_node(
             "inference": inference,
             "field_vars_to_test": field_vars_to_test,
             "responses": responses,
+            "phase": phase,
+            "evidence": node_evidence,
+            "new_evidence": [item for item in node_evidence if item not in previous_evidence],
             "subsequent_steps": subsequent_steps,
             "status": status,
         },
@@ -128,6 +144,9 @@ def pruned_web_context(chal_ID: int, max_ancestors: int = 4) -> dict[str, Any]:
             {
                 "field": result.get("field"),
                 "status_code": result.get("status_code"),
+                "classification": result.get("classification"),
+                "filter_terms": result.get("filter_terms", []),
+                "error_markers": result.get("error_markers", []),
                 "evidence": str(result.get("text", ""))[:600],
             }
             for result in responses[-8:]
@@ -140,6 +159,8 @@ def pruned_web_context(chal_ID: int, max_ancestors: int = 4) -> dict[str, Any]:
                 "inference": node.get("inference", ""),
                 "field_vars_to_test": node.get("field_vars_to_test", []),
                 "responses": compact_responses,
+                "phase": node.get("phase", "discovery"),
+                "new_evidence": node.get("new_evidence", []),
                 "subsequent_steps": node.get("subsequent_steps", []),
                 "status": node.get("status", "active"),
             }
@@ -154,4 +175,34 @@ def pruned_web_context(chal_ID: int, max_ancestors: int = 4) -> dict[str, Any]:
         "active_node_id": context["active_node_id"],
         "active_branch": path[-max_ancestors:],
         "node_count": len(nodes),
+        "known_evidence": sorted(
+            {
+                item
+                for node in nodes.values()
+                for item in node.get("evidence", [])
+                if isinstance(item, str)
+            }
+        ),
     }
+
+
+def attempted_test_keys(chal_ID: int) -> set[str]:
+    """Return normalized field/value keys already submitted for this challenge."""
+    context = get_web_context(chal_ID)
+    keys: set[str] = set()
+    for node in context["nodes"].values():
+        for test in node.get("field_vars_to_test", []):
+            if isinstance(test, dict) and isinstance(test.get("field"), str):
+                keys.add(json.dumps([test["field"], test.get("value")], sort_keys=True))
+    return keys
+
+
+
+def has_recent_evidence_stall(chal_ID: int, limit: int) -> bool:
+    """Return whether recent submitted web experiments produced no new evidence."""
+    if limit < 1:
+        raise ValueError("limit must be positive")
+    nodes = list(get_web_context(chal_ID)["nodes"].values())
+    experiments = [node for node in nodes if node.get("id") != "root" and node.get("responses")]
+    recent = experiments[-limit:]
+    return len(recent) == limit and not any(node.get("new_evidence") for node in recent)

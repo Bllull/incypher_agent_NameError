@@ -3,30 +3,16 @@
 from __future__ import annotations
 
 import json
-import re
 
-from tools.context import get_context, update_context
+from tools.context import append_context_list, get_context
 from tools.ctfd_api import connect_challenge_tcp
+from tools.flags import extract_flag
 from tools.llm_router import call_openai
-
-
-_FLAG_PATTERN = re.compile(r"(?:INCYPHER|flag)\{[^\r\n}]+\}", re.IGNORECASE)
-
-
-def _find_flag(text: str) -> str | None:
-    """Return the first flag-shaped value sent by the challenge service."""
-    match = _FLAG_PATTERN.search(text)
-    return match.group(0) if match else None
 
 
 def _append_attempt(chal_ID: int, **attempt: str | int) -> None:
     """Append one port-solver attempt to the JSON ``port_attempts`` field."""
-    context = get_context(chal_ID) or {}
-    attempts = context.get("port_attempts", [])
-    if not isinstance(attempts, list):
-        attempts = []
-    attempts.append(attempt)
-    update_context({"port_attempts": attempts}, chal_ID)
+    append_context_list([attempt], "port_attempts", chal_ID)
 
 
 def port_chal_solver(chal_ID: int) -> str | None:
@@ -41,7 +27,7 @@ def port_chal_solver(chal_ID: int) -> str | None:
     try:
         challenge_connection = connect_challenge_tcp(chal_ID)
         opening_response = challenge_connection.recv(4096).decode(errors="replace")
-        opening_flag = _find_flag(opening_response)
+        opening_flag = extract_flag(opening_response)
         if opening_flag:
             return opening_flag
 
@@ -61,7 +47,7 @@ def port_chal_solver(chal_ID: int) -> str | None:
 
         challenge_connection.sendall((commands + "\n").encode())
         response = challenge_connection.recv(4096).decode(errors="replace")
-        flag = _find_flag(response)
+        flag = extract_flag(response)
         if flag:
             return flag
 

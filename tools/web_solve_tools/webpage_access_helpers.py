@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import urljoin
@@ -10,9 +9,8 @@ from urllib.parse import urljoin
 import requests
 
 from tools.http_client import create_session, interact_http
+from tools.flags import extract_flag
 from tools.web_solve_tools.web_context import store_form_schema
-
-_FLAG_PATTERN = re.compile(r"INCYPHER\{[^\r\n}]+\}")
 
 
 class _FormParser(HTMLParser):
@@ -182,9 +180,3 @@ def validate_form_json(
     valid = 200 <= response.status_code < 400
     print(f"[web] form validation: {'passed' if valid else 'failed'}")
     return valid
-
-
-def extract_flag(text: str) -> str | None:
-    """Return an INCYPHER flag from a response body, if present."""
-    match = _FLAG_PATTERN.search(text)
-    return match.group(0) if match else None

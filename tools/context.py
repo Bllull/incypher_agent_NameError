@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 
 CONTEXT_DB_PATH = (
@@ -32,21 +33,29 @@ def _validate_context(context: Context) -> Context:
     return context
 
 
-def _connect() -> sqlite3.Connection:
+@contextmanager
+def _connect() -> Iterator[sqlite3.Connection]:
     """Open the local context database and ensure its JSON schema exists."""
     CONTEXT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(CONTEXT_DB_PATH)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS challenge_contexts (
-            challenge_id INTEGER PRIMARY KEY,
-            context_json TEXT NOT NULL DEFAULT '{}',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    try:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS challenge_contexts (
+                challenge_id INTEGER PRIMARY KEY,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """
         )
-        """
-    )
-    return connection
+        yield connection
+        connection.commit()
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def store_context(context: Context, chal_ID: int) -> None:
@@ -88,6 +97,7 @@ def update_context(context: Context, chal_ID: int) -> None:
     challenge_id = _validate_challenge_id(chal_ID)
     updates = _validate_context(context)
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
         row = connection.execute(
             "SELECT context_json FROM challenge_contexts WHERE challenge_id = ?",
             (challenge_id,),
@@ -106,6 +116,61 @@ def update_context(context: Context, chal_ID: int) -> None:
             """,
             (challenge_id, json.dumps(current, sort_keys=True)),
         )
+
+
+def append_context_list(
+    values: list[Any],
+    field: str,
+    chal_ID: int,
+    *,
+    unique: bool = False,
+) -> None:
+    """Atomically append JSON values to a list field in challenge context."""
+    challenge_id = _validate_challenge_id(chal_ID)
+    if not isinstance(field, str) or not field.strip():
+        raise ValueError("field must be a non-empty string")
+    try:
+        json.dumps(values)
+    except (TypeError, ValueError) as exc:
+        raise TypeError("values must contain JSON-serializable items") from exc
+
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT context_json FROM challenge_contexts WHERE challenge_id = ?",
+            (challenge_id,),
+        ).fetchone()
+        current = {} if row is None else json.loads(row[0])
+        if not isinstance(current, dict):
+            raise ValueError(f"Stored context for challenge {challenge_id} is not a dictionary")
+
+        existing = current.get(field, [])
+        if not isinstance(existing, list):
+            raise ValueError(f"Context field {field!r} is not a list")
+        for value in values:
+            if not unique or value not in existing:
+                existing.append(value)
+        current[field] = existing
+
+        connection.execute(
+            """
+            INSERT INTO challenge_contexts (challenge_id, context_json)
+            VALUES (?, ?)
+            ON CONFLICT(challenge_id) DO UPDATE SET
+                context_json = excluded.context_json,
+                updated_at = CURRENT_TIMESTAMP
+            """,
+            (challenge_id, json.dumps(current, sort_keys=True)),
+        )
+
+
+def store_artifact_paths(filepaths: list[str], chal_ID: int) -> None:
+    """Record unique generated artifact paths in challenge context."""
+    if not isinstance(filepaths, list) or not all(
+        isinstance(filepath, str) and filepath.strip() for filepath in filepaths
+    ):
+        raise ValueError("filepaths must be a list of non-empty strings")
+    append_context_list(filepaths, "converted_file_paths", chal_ID, unique=True)
 
 
 def delete_context(chal_ID: int) -> None:

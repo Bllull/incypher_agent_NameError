@@ -6,8 +6,8 @@ import hashlib
 import re
 from typing import Any
 
+from tools.flags import extract_flag
 
-_FLAG_PATTERN = re.compile(r"INCYPHER\{[^\r\n}]+\}")
 _REJECTION_PATTERN = re.compile(
     r"(?:blocked|forbidden|disallowed|not allowed|blacklist(?:ed)?)"
     r"(?:\s+(?:token|term|word|character))?\s*[:=]?\s*['\"]?([\w./-]{1,64})?",
@@ -45,7 +45,7 @@ def analyze_ssti_response(
     )
     rejected = bool(rejection_terms) or bool(_REJECTION_PATTERN.search(text))
     errors = [marker for marker in _ERROR_MARKERS if marker in lowered]
-    flag = _FLAG_PATTERN.search(text)
+    flag = extract_flag(text)
     payload_values = [str(value) for value in payload.values()]
     reflected = any(value and value in text for value in payload_values)
     expected_observed = bool(expected_output and expected_output in text)

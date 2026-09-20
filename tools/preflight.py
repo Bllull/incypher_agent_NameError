@@ -10,8 +10,6 @@ import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
-from openai import OpenAI
-
 import tools.config  # Load repository-local credentials before reading them.
 from tools.context import get_context
 from tools.ctfd_api import (
@@ -22,7 +20,9 @@ from tools.ctfd_api import (
     extract_challenge_description,
     get_challenges,
     identify_challenge_type,
+    prepare_challenge_context,
 )
+from tools.llm_router import list_openai_models
 
 
 def check_soclaas_connection() -> bool:
@@ -33,14 +33,14 @@ def check_soclaas_connection() -> bool:
         print("[-] SOCLAAS_API_KEY or SOCLAAS_BASE_URL is not set.")
         return False
 
-    print(f"[*] Testing SoClass API access at {base_url}")
+    print(f"[*] Testing SOCLAas API access at {base_url}")
     try:
-        OpenAI(api_key=api_key, base_url=base_url).models.list()
+        models = list_openai_models(max_attempts=1)
     except Exception as exc:
-        print(f"[-] SoClass API access failed: {exc}")
+        print(f"[-] SOCLAas API access failed: {exc}")
         return False
 
-    print("[+] SoClass API access succeeded.")
+    print(f"[+] SOCLAas API access succeeded: {len(models)} model(s) available.")
     return True
 
 
@@ -51,7 +51,10 @@ def check_challenge_url_connection(challenges: list[dict]) -> bool:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
             challenge_id = int(challenge.get("id")) #type: ignore
-            if identify_challenge_type(challenge_id) != "url":
+            context = get_context(challenge_id)
+            if context is None:
+                raise ValueError("challenge context was not prepared")
+            if identify_challenge_type(challenge_id, context) != "url":
                 continue
             challenge_url = get_challenge_url(challenge_id)
         except (TypeError, ValueError) as exc:
@@ -80,7 +83,10 @@ def check_challenge_tcp_connection(challenges: list[dict]) -> bool:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
             challenge_id = int(challenge.get("id")) #type: ignore
-            if identify_challenge_type(challenge_id) != "tcp":
+            context = get_context(challenge_id)
+            if context is None:
+                raise ValueError("challenge context was not prepared")
+            if identify_challenge_type(challenge_id, context) != "tcp":
                 continue
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
@@ -123,7 +129,10 @@ def check_challenge_description_retrieval(challenges: list[dict]) -> bool:
             continue
 
         try:
-            _, description = extract_challenge_description(challenge_id)
+            context = get_context(challenge_id)
+            if context is None:
+                raise ValueError("challenge context was not prepared")
+            _, description = extract_challenge_description(challenge_id, context)
         except Exception as exc:
             print(f"[-] Could not retrieve description for {challenge_name}: {exc}")
             continue
@@ -212,12 +221,28 @@ def main() -> int:
         return 1
 
     print(f"[+] Platform access succeeded: {len(challenges)} challenge(s) returned.")
+    prepared_challenges: list[dict] = []
     for challenge in challenges:
         challenge_id = challenge.get("id", "unknown")
         name = challenge.get("name", "unnamed")
         category = challenge.get("category", "uncategorized")
         value = challenge.get("value", "unknown")
         print(f"    [{challenge_id}] {name} | category={category} | value={value}")
+        try:
+            normalized_id = int(challenge_id)
+            prepare_challenge_context(normalized_id, str(name))
+        except (TypeError, ValueError) as exc:
+            print(f"[-] Skipping challenge with invalid details: {name}: {exc}")
+            continue
+        except Exception as exc:
+            print(f"[-] Could not prepare challenge context for {name}: {exc}")
+            continue
+        prepared_challenges.append(challenge)
+
+    if not prepared_challenges:
+        print("[-] No challenge details could be prepared.")
+        return 1
+    challenges = prepared_challenges
 
     if not check_challenge_url_connection(challenges):
         return 1

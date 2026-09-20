@@ -9,7 +9,7 @@ import requests
 from tools.context import get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
 from tools.http_client import create_session
-from tools.web_solve_tools.web_llm import call_web_llm
+from tools.llm_router import call_openai
 from tools.web_solve_tools.webpage_access_helpers import extract_flag, get_form_json, submit_form
 from tools.web_solve_tools.web_context import (
     append_web_node,
@@ -54,7 +54,7 @@ Previously collected web workflow context:
 {json.dumps(web_context, sort_keys=True)}
 """
     try:
-        answer = call_web_llm(prompt).strip().upper()
+        answer = call_openai(prompt).strip().upper()
     except Exception as exc:
         print(f"[web] Challenge {chal_ID} subtype classification failed: {exc}")
         return "UNKNOWN"
@@ -168,8 +168,8 @@ Pruned workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
     return _parse_ssti_plan(
-        call_web_llm(prompt, require_deep_reasoning=True),
-        form_schema.get("fields", {}),
+        call_openai(prompt, require_deep_reasoning=True),
+        form_schema.get("fields", {}), #type: ignore
     )
 
 

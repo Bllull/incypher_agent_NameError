@@ -7,16 +7,9 @@ import stat
 import zipfile
 from pathlib import Path
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Any, Literal
 
-import matplotlib
-import numpy as np
-import soundfile as sf
-
-from tools.context import get_context, update_context
-
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+from tools.context import store_artifact_paths
 
 
 AudioConversionType = Literal[1, 2]
@@ -30,8 +23,11 @@ def _output_path(audio_path: Path, conversion_type: AudioConversionType) -> Path
     return audio_path.with_name(f"{audio_path.stem}_{suffix}.png")
 
 
-def _mono_samples(audio_path: Path) -> tuple[np.ndarray, int]:
+def _mono_samples(audio_path: Path) -> tuple[Any, int]:
     """Load mono audio or down-mix stereo audio to mono."""
+    import numpy as np
+    import soundfile as sf
+
     samples, sample_rate = sf.read(audio_path, always_2d=False)
     if samples.size < 2:
         raise ValueError("audio file must contain at least two samples")
@@ -51,28 +47,12 @@ def _spectrogram_nfft(sample_count: int) -> int:
     NumPy-backed FFT implementation run efficiently. The value is capped at
     1024 samples to retain useful time resolution, and reduced for short clips.
     """
-    return 2 ** int(np.floor(np.log2(min(1024, sample_count))))
+    return 1 << (min(1024, sample_count).bit_length() - 1)
 
 
 def _store_converted_files(output_paths: list[Path], chal_ID: int) -> None:
     """Add generated file paths to a challenge's JSON context."""
-    context = get_context(chal_ID) or {}
-    existing_paths = context.get("converted_file_paths", [])
-    if not isinstance(existing_paths, list) or not all(
-        isinstance(path, str) for path in existing_paths
-    ):
-        existing_paths = []
-
-    for output_path in output_paths:
-        resolved_path = str(output_path.resolve())
-        if resolved_path not in existing_paths:
-            existing_paths.append(resolved_path)
-    update_context({"converted_file_paths": existing_paths}, chal_ID)
-
-
-def _store_converted_file(output_path: Path, chal_ID: int) -> None:
-    """Add one generated file path to a challenge's JSON context."""
-    _store_converted_files([output_path], chal_ID)
+    store_artifact_paths([str(output_path.resolve()) for output_path in output_paths], chal_ID)
 
 
 def convert_audio_file(
@@ -102,6 +82,12 @@ def convert_audio_file(
         raise ValueError("output_path must use a .png extension")
     destination.parent.mkdir(parents=True, exist_ok=True)
 
+    import matplotlib
+    import numpy as np
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
     samples, sample_rate = _mono_samples(source)
     figure, axis = plt.subplots(figsize=(12, 4), layout="constrained")
     try:
@@ -122,7 +108,7 @@ def convert_audio_file(
         plt.close(figure)
 
     resolved_destination = destination.resolve()
-    _store_converted_file(resolved_destination, chal_ID)
+    _store_converted_files([resolved_destination], chal_ID)
     return resolved_destination
 
 

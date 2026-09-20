@@ -48,8 +48,10 @@ classDiagram
         +main()
     }
     class ctfd_api_py {
+        +CTFdClient
         +get_challenges()
         +get_challenge_details()
+        +prepare_challenge_context()
         +identify_challenge_type()
         +extract_challenge_description()
         +download_challenge_files()
@@ -71,6 +73,8 @@ classDiagram
         +store_context(context, chal_ID)
         +get_context(chal_ID) dict | None
         +update_context(context, chal_ID)
+        +append_context_list(values, field, chal_ID)
+        +store_artifact_paths(filepaths, chal_ID)
         +delete_context(chal_ID)
         +store_name()
         +get_name()
@@ -83,6 +87,7 @@ classDiagram
     class llm_router_py {
         +call_openai()
         +call_multimodal_openai(prompt, image_paths, model_name)
+        +list_openai_models()
     }
     class converter_py {
         +convert_audio_file(audio_path, conversion_type, output_path, chal_ID) Path
@@ -98,6 +103,7 @@ classDiagram
         +file_chal_solver(chal_ID) str | None
     }
     class tcp_client_py {
+        +connect_tcp()
         +interact_tcp()
     }
     class http_client_py {
@@ -108,8 +114,10 @@ classDiagram
         +get_form_json()
         +submit_form()
         +validate_form_json()
-        +append_validated_form_context()
         +extract_flag()
+    }
+    class flags_py {
+        +extract_flag(text) str | None
     }
     class solver_py {
         +connect()
@@ -125,7 +133,10 @@ classDiagram
     file_chal_py --> agent_py : str flag (solved) or None (retry)
     preflight_py --> ctfd_api_py : verifies API data
     preflight_py --> context_py : verifies SQLite storage
+    preflight_py --> llm_router_py : verifies SOCLAas connectivity
     ctfd_api_py --> config_py : loads credentials
+    ctfd_api_py --> context_py : reads prepared challenge data
+    ctfd_api_py --> tcp_client_py : opens platform TCP connection
     llm_router_py --> config_py : loads credentials
     tcp_client_py --> solver_py : opens TCP connection
     web_chal_py --> context_py : reads and updates JSON context
@@ -134,8 +145,9 @@ classDiagram
     web_chal_py --> webpage_access_helpers_py : discovers and submits forms
     webpage_access_helpers_py --> context_py : stores validated schema
     port_chal_py --> context_py : reads challenge context
-    port_chal_py --> tcp_client_py : planned TCP use
+    port_chal_py --> ctfd_api_py : requests challenge TCP connection
+    port_chal_py --> flags_py : validates exact flag format
     file_chal_py --> context_py : reads challenge context
-    converter_py --> llm_router_py : produces image-compatible audio views
     converter_py --> context_py : records converted file paths
+    webpage_access_helpers_py --> flags_py : validates exact flag format
 ```

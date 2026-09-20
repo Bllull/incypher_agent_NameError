@@ -2,30 +2,36 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import time
 
-from tools.context import store_chal_file_path, store_context, store_name, update_context
+from tools.context import update_context
 from tools.ctfd_api import (
     download_challenge_files,
-    extract_challenge_description,
     get_challenges,
-    identify_challenge_type,
+    prepare_challenge_context,
 )
 from tools.file_chal import file_chal_solver
+from tools.flags import extract_flag
 from tools.port_chal import port_chal_solver
 from tools.web_chal import web_chal_solver
 
 
+Solver = Callable[[int], str | None]
+SOLVERS: dict[str, Solver] = {
+    "url": web_chal_solver,
+    "tcp": port_chal_solver,
+    "file": file_chal_solver,
+}
+
+
 def _delegate(challenge_type: str, chal_ID: int) -> str | None:
     """Pass a prepared challenge to its matching solver and return its flag."""
-    if challenge_type == "web":
-        return web_chal_solver(chal_ID)
-    elif challenge_type == "port":
-        return port_chal_solver(chal_ID)
-    elif challenge_type == "file":
-        return file_chal_solver(chal_ID)
-    else:
+    solver = SOLVERS.get(challenge_type)
+    if solver is None:
         raise ValueError(f"Unsupported challenge type: {challenge_type}")
+    result = solver(chal_ID)
+    return extract_flag(result) if result else None
 
 
 def main() -> None:
@@ -46,34 +52,26 @@ def main() -> None:
     for challenge in challenges:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
-            chal_ID = int(challenge.get("id"))
+            chal_ID = int(challenge.get("id")) #type: ignore
         except (TypeError, ValueError):
             print(f"[-] Skipping challenge with invalid ID: {challenge_name}")
             continue
 
         try:
-            retrieved_name, description = extract_challenge_description(chal_ID)
-            if retrieved_name:
-                challenge_name = retrieved_name
-            store_name(challenge_name, chal_ID)
-            store_context({"description": description}, chal_ID)
-            challenge_kind = identify_challenge_type(chal_ID)
-            challenge_type = {"url": "web", "tcp": "port", "file": "file"}.get(
-                challenge_kind
-            )
-            if challenge_type is None:
-                raise ValueError(f"Unsupported challenge type: {challenge_kind}")
+            context = prepare_challenge_context(chal_ID, challenge_name)
+            challenge_name = str(context["name"])
+            challenge_kind = str(context["challenge_type"])
 
             if challenge_kind == "file":
                 file_paths = download_challenge_files(challenge_name, chal_ID)
                 if file_paths:
-                    store_chal_file_path(file_paths[0], chal_ID)
-                    if len(file_paths) > 1:
-                        update_context({"additional_file_paths": file_paths[1:]}, chal_ID)
+                    update_context(
+                        {"file_path": file_paths[0], "file_paths": file_paths}, chal_ID
+                    )
 
-            print(f"[*] Delegating [{chal_ID}] {challenge_name} as {challenge_type}.")
-            if not _delegate(challenge_type, chal_ID):
-                unsolved.append((challenge_name, chal_ID, challenge_type))
+            print(f"[*] Delegating [{chal_ID}] {challenge_name} as {challenge_kind}.")
+            if not _delegate(challenge_kind, chal_ID):
+                unsolved.append((challenge_name, chal_ID, challenge_kind))
         except Exception as exc:
             print(f"[FATAL] Challenge [{chal_ID}] {challenge_name} failed: {exc}")
             return

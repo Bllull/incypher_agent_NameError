@@ -8,11 +8,11 @@ values are reserved for shared workflow context.
 
 ### `agent.py`
 
-- `main()` fetches the CTFd challenge list, stores each challenge's name and
-  description as JSON context, downloads file assets when needed, and delegates
-  to the matching solver. Challenges returning no flag are retried.
+- `main()` fetches each challenge detail record once, prepares its JSON context,
+  downloads file assets when needed, and delegates to the matching solver.
+  Challenges returning no valid flag are retried.
 - `_delegate(challenge_type, chal_ID)` selects the web, port, or file solver
-  and returns its flag string or `None`.
+  and accepts only an exact `INCYPHER{...}` flag string.
 
 ## Persistent context
 
@@ -24,6 +24,10 @@ All context records are JSON dictionaries stored in the local SQLite database.
 - `get_context(chal_ID)` returns the record dictionary, or `None` when absent.
 - `update_context(context, chal_ID)` shallow-merges fields into an existing
   record; matching keys are replaced.
+- `append_context_list(values, field, chal_ID, unique=False)` atomically appends
+  JSON values to a list field.
+- `store_artifact_paths(filepaths, chal_ID)` records unique generated paths in
+  `converted_file_paths`.
 - `delete_context(chal_ID)` removes one record if it exists.
 - `store_name(name, chal_ID)` and `get_name(chal_ID)` manage the `name` field.
 - `store_chal_file_path(filepath, chal_ID)` and
@@ -33,18 +37,23 @@ All context records are JSON dictionaries stored in the local SQLite database.
 
 ### `tools/ctfd_api.py`
 
+- `CTFdClient` owns the authenticated HTTP session, timeout, JSON decoding, and
+  status handling shared by all CTFd requests.
 - `get_challenges()` returns the visible CTFd challenge summaries.
 - `get_challenge_details(challenge_id)` returns one CTFd detail object.
+- `prepare_challenge_context(challenge_id, listed_name)` fetches details once
+  and stores the normalized name, description, type, and file links.
 - `extract_challenge_description(challenge_id)` returns `(name, description)`.
 - `identify_challenge_type(challenge_id)` returns `file`, `url`, or `tcp`.
   Downloadable files take priority; otherwise `http` in the description denotes
   a URL challenge.
-- `download_challenge_files(challenge_name, challenge_id)` downloads CTFd file
-  links and returns their local absolute paths.
+- `download_challenge_files(challenge_name, challenge_id)` downloads the file
+  links in stored context and returns their local absolute paths.
 - `get_challenge_url(challenge_id)` returns the deployed URL or asks for a
   manually deployed URL when the Docker platform is unavailable.
 - `connect_challenge_tcp(challenge_id, timeout=15)` opens a TCP socket to a
-  deployed instance or a manually supplied `nc HOST PORT` endpoint.
+  deployed instance or a manually supplied `nc HOST PORT` endpoint through the
+  platform `solver.connect` adapter.
 - `deploy_instance(challenge_id)` requests a CTFd container deployment.
 - `submit_flag(challenge_id, flag)` submits a candidate flag to CTFd.
 
@@ -52,11 +61,15 @@ All context records are JSON dictionaries stored in the local SQLite database.
 
 ### `tools/llm_router.py`
 
-- `call_openai(prompt, require_deep_reasoning=False)` sends a text chat request
-  using the `default` alias, or `coding` when deeper reasoning is requested.
+- `call_openai(prompt, require_deep_reasoning=False, *, max_attempts=3)` sends a
+  text chat request using the `default` alias, or `coding` when deeper reasoning
+  is requested. Transient connection errors and HTTP 408, 429, 500, 502, 503,
+  and 504 responses are retried with bounded exponential backoff.
 - `call_multimodal_openai(prompt, image_paths, model_name='qwen3-vl:32b')`
   sends prompt text and local JPEG, PNG, GIF, or WebP images as data URLs to a
-  vision-capable chat model.
+  vision-capable chat model using the same retry policy.
+- `list_openai_models(max_attempts=3)` lists model IDs through that same client
+  and retry path; preflight uses this instead of constructing another client.
 
 ## File conversion
 
@@ -95,9 +108,13 @@ All context records are JSON dictionaries stored in the local SQLite database.
   POST form submissions.
 - `validate_form_json(form_schema, session, test_variables)` submits safe test
   values and accepts HTTP responses in the 2xx or 3xx range.
-- `append_validated_form_context(chal_ID, form_schema)` stores the schema in
-  shared web context. Its name is retained, but it writes JSON rather than text.
-- `extract_flag(text)` returns the first `INCYPHER{...}` value in a response.
+- `extract_flag(text)` is imported from `tools/flags.py` and returns the first
+  exact, case-sensitive `INCYPHER{...}` value in a response.
+
+### `tools/flags.py`
+
+- `extract_flag(text)` is the shared flag recognizer used by orchestration,
+  web response analysis, and the TCP solver.
 
 ## HTTP and TCP helpers
 
@@ -112,18 +129,22 @@ All context records are JSON dictionaries stored in the local SQLite database.
 
 ### `tools/tcp_client.py` and `solver.py`
 
+- `connect_tcp(ip, port, team_key)` is the single adapter around
+  `solver.connect`.
 - `interact_tcp(ip, port, team_key, payload=None)` opens a platform TCP
   connection, optionally sends one line, then returns the first response.
-- `connect(ip, port, team_key)` is the current socket connection helper used by
-  `interact_tcp`.
+- `solver.connect(ip, port, team_key)` is currently a local mock because the
+  platform helper library is unavailable. Replace the mock when that helper is
+  supplied; callers do not need to change.
 
 ## Solver placeholders
 
 ### `tools/port_chal.py` and `tools/file_chal.py`
 
-- `port_chal_solver(chal_ID)` and `file_chal_solver(chal_ID)` currently print
-  stored context and return placeholder flags. Their full solving logic has not
-  yet been implemented.
+- `port_chal_solver(chal_ID)` connects, asks the LLM for one input, records an
+  unsuccessful attempt atomically, and returns an observed valid flag.
+- `file_chal_solver(chal_ID)` remains a placeholder that prints stored context
+  and returns a synthetic flag.
 
 ## Preflight
 
@@ -140,3 +161,6 @@ All context records are JSON dictionaries stored in the local SQLite database.
   asset when available.
 - `check_context_sqlite_connection()` verifies the local context database opens.
 - `main()` runs the checks in order and returns a process exit code.
+
+Run `scripts/test_soclaas.ps1` for a live model-list and text-completion check.
+Pass `-ImagePath <path>` to include a multimodal request.

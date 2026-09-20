@@ -44,9 +44,10 @@ All context records are JSON dictionaries stored in the local SQLite database.
 - `prepare_challenge_context(challenge_id, listed_name)` fetches details once
   and stores the normalized name, description, type, and file links.
 - `extract_challenge_description(challenge_id)` returns `(name, description)`.
-- `identify_challenge_type(challenge_id)` returns `file`, `url`, or `tcp`.
-  Downloadable files take priority; otherwise `http` in the description denotes
-  a URL challenge.
+- `identify_challenge_type(challenge_id, details=None)` returns `file`, `url`, or
+  `tcp` for either raw API details or normalized stored context. Downloadable
+  files take priority. Web categories, HTTP(S) targets, and explicit SSTI/Jinja
+  descriptions denote URL challenges; remaining challenges are TCP.
 - `download_challenge_files(challenge_name, challenge_id)` downloads the file
   links in stored context and returns their local absolute paths.
 - `get_challenge_url(challenge_id)` returns the deployed URL or asks for a
@@ -126,6 +127,12 @@ All context records are JSON dictionaries stored in the local SQLite database.
   destinations.
 - `interact_http(session, base_url, method, path, params, data, timeout)` sends
   a bounded same-origin GET or form-encoded POST request.
+- `request_json(session, base_url, method, path, params, json_body, timeout)`
+  sends a same-origin GET or JSON-encoded POST and returns a decoded JSON object
+  or array.
+- `graphql_query(session, base_url, query, variables, path, operation_name,
+  timeout)` posts a GraphQL operation and returns the full response object,
+  including any GraphQL `errors` entries.
 
 ### `tools/tcp_client.py` and `solver.py`
 
@@ -155,12 +162,10 @@ All context records are JSON dictionaries stored in the local SQLite database.
 - `check_challenge_url_connection(challenges)` and
   `check_challenge_tcp_connection(challenges)` attempt one suitable challenge
   connection while continuing past individual failures.
-- `check_challenge_description_retrieval(challenges)` verifies CTFd description
-  access.
+- `check_context_retrieval(challenges)` verifies that normalized challenge
+  fields can be read from stored context.
 - `check_challenge_file_download(challenges)` verifies one downloadable file
-  asset when available.
-- `check_context_sqlite_connection()` verifies the local context database opens.
+  asset and retrieves its stored primary path and complete path list.
+- `check_context_sqlite_connection()` opens SQLite directly and performs a
+  minimal query.
 - `main()` runs the checks in order and returns a process exit code.
-
-Run `scripts/test_soclaas.ps1` for a live model-list and text-completion check.
-Pass `-ImagePath <path>` to include a multimodal request.

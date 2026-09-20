@@ -64,7 +64,7 @@ classDiagram
         +check_soclaas_connection()
         +check_challenge_url_connection()
         +check_challenge_tcp_connection()
-        +check_challenge_description_retrieval()
+        +check_context_retrieval()
         +check_challenge_file_download()
         +check_context_sqlite_connection()
     }
@@ -109,6 +109,8 @@ classDiagram
     class http_client_py {
         +create_session()
         +interact_http()
+        +request_json()
+        +graphql_query()
     }
     class webpage_access_helpers_py {
         +get_form_json()

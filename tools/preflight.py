@@ -1,4 +1,4 @@
-"""Connectivity, description, and challenge-file preflight for the agent workflow.
+"""API, challenge-connectivity, context, file, and SQLite preflight checks.
 
 Run with: ``python -m tools.preflight``.
 """
@@ -6,23 +6,38 @@ Run with: ``python -m tools.preflight``.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
 
 import tools.config  # Load repository-local credentials before reading them.
-from tools.context import get_context
+from tools.context import (
+    CONTEXT_DB_PATH,
+    get_chal_file_path,
+    get_context,
+    update_context,
+)
 from tools.ctfd_api import (
     PLATFORM_URL,
     connect_challenge_tcp,
-    get_challenge_url,
     download_challenge_files,
-    extract_challenge_description,
+    get_challenge_url,
     get_challenges,
-    identify_challenge_type,
     prepare_challenge_context,
 )
 from tools.llm_router import list_openai_models
+
+
+def _stored_challenge_type(challenge_id: int) -> str:
+    """Return a validated challenge type from prepared context."""
+    context = get_context(challenge_id)
+    if context is None:
+        raise ValueError("challenge context was not prepared")
+    challenge_type = context.get("challenge_type")
+    if challenge_type not in {"file", "url", "tcp"}:
+        raise ValueError(f"invalid stored challenge type: {challenge_type!r}")
+    return str(challenge_type)
 
 
 def check_soclaas_connection() -> bool:
@@ -51,10 +66,7 @@ def check_challenge_url_connection(challenges: list[dict]) -> bool:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
             challenge_id = int(challenge.get("id")) #type: ignore
-            context = get_context(challenge_id)
-            if context is None:
-                raise ValueError("challenge context was not prepared")
-            if identify_challenge_type(challenge_id, context) != "url":
+            if _stored_challenge_type(challenge_id) != "url":
                 continue
             challenge_url = get_challenge_url(challenge_id)
         except (TypeError, ValueError) as exc:
@@ -83,10 +95,7 @@ def check_challenge_tcp_connection(challenges: list[dict]) -> bool:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
             challenge_id = int(challenge.get("id")) #type: ignore
-            context = get_context(challenge_id)
-            if context is None:
-                raise ValueError("challenge context was not prepared")
-            if identify_challenge_type(challenge_id, context) != "tcp":
+            if _stored_challenge_type(challenge_id) != "tcp":
                 continue
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
@@ -114,36 +123,36 @@ def check_challenge_tcp_connection(challenges: list[dict]) -> bool:
     return False
 
 
-def check_challenge_description_retrieval(challenges: list[dict]) -> bool:
-    """Verify that at least one CTFd ``data.description`` value is retrieved."""
-    print("[*] Looking for a challenge description to verify retrieval...")
+def check_context_retrieval(challenges: list[dict]) -> bool:
+    """Verify that prepared challenge data can be retrieved from context."""
+    print("[*] Testing stored challenge-context retrieval...")
     for challenge in challenges:
         challenge_name = str(challenge.get("name", "unnamed"))
         try:
             challenge_id = int(challenge.get("id")) #type: ignore
+            if _stored_challenge_type(challenge_id) != "file":
+                continue
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {challenge_name}: {exc}")
-            continue
-        except Exception as exc:
-            print(f"[-] Could not retrieve details for {challenge_name}: {exc}")
             continue
 
         try:
             context = get_context(challenge_id)
             if context is None:
-                raise ValueError("challenge context was not prepared")
-            _, description = extract_challenge_description(challenge_id, context)
+                raise ValueError("prepared context was not found")
+            required_fields = {"name", "description", "challenge_type", "file_links"}
+            missing_fields = required_fields.difference(context)
+            if missing_fields:
+                raise ValueError(
+                    f"prepared context is missing: {', '.join(sorted(missing_fields))}"
+                )
         except Exception as exc:
-            print(f"[-] Could not retrieve description for {challenge_name}: {exc}")
+            print(f"[-] Context retrieval failed for [{challenge_id}] {challenge_name}: {exc}")
             continue
-        if description:
-            print(
-                f"[+] Challenge description retrieval succeeded for "
-                f"[{challenge_id}] {challenge_name}: {len(description)} character(s)."
-            )
-            return True
+        print(f"[+] Context retrieval succeeded for [{challenge_id}] {challenge_name}.")
+        return True
 
-    print("[-] No non-empty CTFd data.description value was available to verify.")
+    print("[-] No prepared challenge context could be retrieved.")
     return False
 
 
@@ -178,8 +187,21 @@ def check_challenge_file_download(challenges: list[dict]) -> bool:
         if missing_paths:
             print(f"[-] Download reported missing file(s): {', '.join(missing_paths)}")
             return False
+
+        update_context(
+            {"file_path": downloaded_paths[0], "file_paths": downloaded_paths},
+            challenge_id,
+        )
+        stored_primary_path = get_chal_file_path(challenge_id)
+        stored_context = get_context(challenge_id) or {}
+        if stored_primary_path != downloaded_paths[0]:
+            print(f"[-] Primary file-path retrieval failed for [{challenge_id}] {challenge_name}.")
+            return False
+        if stored_context.get("file_paths") != downloaded_paths:
+            print(f"[-] File-list retrieval failed for [{challenge_id}] {challenge_name}.")
+            return False
         print(
-            f"[+] Challenge file download succeeded for [{challenge_id}] "
+            f"[+] Challenge file download and retrieval succeeded for [{challenge_id}] "
             f"{challenge_name}: {len(downloaded_paths)} file(s)."
         )
         return True
@@ -189,10 +211,12 @@ def check_challenge_file_download(challenges: list[dict]) -> bool:
 
 
 def check_context_sqlite_connection() -> bool:
-    """Verify that the local SQLite-backed context store can be opened."""
+    """Verify a direct connection to the local SQLite context database."""
     print("[*] Testing local context SQLite connection...")
     try:
-        get_context(0)
+        CONTEXT_DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with sqlite3.connect(CONTEXT_DB_PATH) as connection:
+            connection.execute("SELECT 1").fetchone()
     except Exception as exc:
         print(f"[-] Context SQLite connection failed: {exc}")
         return False
@@ -201,7 +225,7 @@ def check_context_sqlite_connection() -> bool:
 
 
 def main() -> int:
-    """Validate API connectivity, challenge listing, descriptions, and files."""
+    """Run the supported endpoint, connectivity, and storage checks."""
     if not check_soclaas_connection():
         return 2
 
@@ -230,13 +254,14 @@ def main() -> int:
         print(f"    [{challenge_id}] {name} | category={category} | value={value}")
         try:
             normalized_id = int(challenge_id)
-            prepare_challenge_context(normalized_id, str(name))
+            context = prepare_challenge_context(normalized_id, str(name))
         except (TypeError, ValueError) as exc:
             print(f"[-] Skipping challenge with invalid details: {name}: {exc}")
             continue
         except Exception as exc:
             print(f"[-] Could not prepare challenge context for {name}: {exc}")
             continue
+        print(f"        classified as {context['challenge_type']}")
         prepared_challenges.append(challenge)
 
     if not prepared_challenges:
@@ -244,11 +269,11 @@ def main() -> int:
         return 1
     challenges = prepared_challenges
 
+    if not check_context_retrieval(challenges):
+        return 1
     if not check_challenge_url_connection(challenges):
         return 1
     if not check_challenge_tcp_connection(challenges):
-        return 1
-    if not check_challenge_description_retrieval(challenges):
         return 1
     if not check_challenge_file_download(challenges):
         return 1

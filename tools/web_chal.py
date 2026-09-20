@@ -8,9 +8,15 @@ import requests
 
 from tools.context import get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
+from tools.flags import extract_flag, extract_flag_from_json
 from tools.http_client import create_session
 from tools.llm_router import call_openai
-from tools.web_solve_tools.webpage_access_helpers import extract_flag, get_form_json, submit_form
+from tools.web_solve_tools.graphql_workflow import (
+    GraphQLOperation,
+    find_graphql_endpoint,
+    run_graphql_operations_at_endpoint,
+)
+from tools.web_solve_tools.webpage_access_helpers import get_form_json, submit_form
 from tools.web_solve_tools.web_context import (
     append_web_node,
     attempted_test_keys,
@@ -23,11 +29,145 @@ from tools.web_solve_tools.web_context import (
 from tools.web_solve_tools.ssti_evidence import analyze_ssti_response
 
 
-WEB_CHALLENGE_SUBTYPES = ("SSTI",)
+WEB_CHALLENGE_SUBTYPES = ("SSTI", "GRAPHQL")
 SSTI_PHASES = ("discovery", "confirmation", "filter_mapping", "capability_mapping", "retrieval")
+GRAPHQL_PHASES = (
+    "root_field_discovery",
+    "selection_discovery",
+    "argument_discovery",
+    "state_transition",
+    "retrieval",
+)
 MAX_SSTI_ITERATIONS = 20
 MAX_SSTI_TESTS_PER_ITERATION = 10
 MAX_SSTI_NO_PROGRESS_ITERATIONS = 3
+MAX_GRAPHQL_ITERATIONS = 12
+MAX_GRAPHQL_OPERATIONS_PER_ITERATION = 4
+MAX_GRAPHQL_NO_PROGRESS_ITERATIONS = 3
+
+
+def _extract_response_flag(response: requests.Response) -> str | None:
+    """Extract a flag from a JSON response, falling back to response text."""
+    try:
+        payload = response.json()
+    except requests.exceptions.JSONDecodeError:
+        payload = None
+    if isinstance(payload, (dict, list)):
+        flag = extract_flag_from_json(payload)
+        if flag:
+            return flag
+    return extract_flag(response.text)
+
+
+def _parse_graphql_plan(raw_plan: str) -> dict[str, object]:
+    """Parse one bounded, evidence-driven GraphQL CTF operation plan."""
+    cleaned = raw_plan.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    plan = json.loads(cleaned)
+    if not isinstance(plan, dict):
+        raise ValueError("GraphQL LLM plan must be a JSON object")
+
+    phase = plan.get("phase")
+    hypothesis = plan.get("hypothesis")
+    operations = plan.get("operations")
+    advance_when = plan.get("advance_when")
+    fallback = plan.get("fallback")
+    if phase not in GRAPHQL_PHASES:
+        raise ValueError(f"GraphQL plan phase must be one of {GRAPHQL_PHASES}")
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError("GraphQL plan hypothesis must be a non-empty string")
+    if not isinstance(operations, list) or not all(
+        isinstance(operation, dict) for operation in operations
+    ):
+        raise ValueError("GraphQL plan operations must be a list of objects")
+    if not isinstance(advance_when, str) or not isinstance(fallback, str):
+        raise ValueError("GraphQL plan advance_when and fallback must be strings")
+
+    normalized_operations: list[dict[str, object]] = []
+    for operation in operations:
+        query = operation.get("query")
+        variables = operation.get("variables", {})
+        operation_name = operation.get("operation_name")
+        purpose = operation.get("purpose")
+        if not isinstance(query, str) or not query.strip():
+            raise ValueError("GraphQL operation query must be a non-empty string")
+        if not isinstance(variables, dict):
+            raise ValueError("GraphQL operation variables must be an object")
+        if operation_name is not None and (
+            not isinstance(operation_name, str) or not operation_name.strip()
+        ):
+            raise ValueError("GraphQL operation_name must be a non-empty string or null")
+        if not isinstance(purpose, str) or not purpose.strip():
+            raise ValueError("GraphQL operation purpose must be a non-empty string")
+        GraphQLOperation(
+            query=query,
+            variables=variables,
+            operation_name=operation_name,
+        )
+        normalized_operations.append(
+            {
+                "query": query,
+                "variables": variables,
+                "operation_name": operation_name,
+                "purpose": purpose,
+            }
+        )
+
+    return {
+        "phase": phase,
+        "hypothesis": hypothesis,
+        "operations": normalized_operations,
+        "advance_when": advance_when,
+        "fallback": fallback,
+    }
+
+
+def _ask_for_graphql_plan(chal_ID: int, endpoint: str) -> dict[str, object]:
+    """Ask for the next small, evidence-gated GraphQL CTF operation set."""
+    challenge_context = get_context(chal_ID) or {}
+    workflow_context = pruned_web_context(chal_ID)
+    prompt = f"""You are solving an explicitly authorized, isolated CTF web challenge.
+
+The confirmed same-origin GraphQL endpoint is {endpoint!r}. Use only the
+challenge context and recorded GraphQL responses below. Treat response facts,
+validator suggestions, returned object fields, and exact flag matches as
+evidence; treat every other claim as a hypothesis.
+
+Choose one phase: root_field_discovery, selection_discovery,
+argument_discovery, state_transition, or retrieval. Start with the smallest
+read-only query that can distinguish hypotheses. You may use a mutation only
+when the challenge description and prior evidence support a specific CTF state
+transition; do not guess credentials, access unrelated systems, scan hosts, or
+perform destructive actions. Do not repeat an operation already represented in
+the workflow context. Stop planning immediately once an exact INCYPHER{{...}}
+flag is returned.
+
+Return JSON only in exactly this shape:
+{{
+  "phase": "one allowed phase",
+  "hypothesis": "short evidence-based hypothesis",
+  "operations": [{{
+    "query": "a complete GraphQL query or evidence-supported mutation",
+    "variables": {{}},
+    "operation_name": "optional named operation or null",
+    "purpose": "the observable fact this harmless CTF operation distinguishes"
+  }}],
+  "advance_when": "observable condition for changing phase",
+  "fallback": "next evidence-gated action if the condition is absent"
+}}
+
+Provide at most {MAX_GRAPHQL_OPERATIONS_PER_ITERATION} operations. Keep each
+operation and explanation concise. Do not provide chain-of-thought.
+
+Challenge ID: {chal_ID}
+Challenge context:
+{json.dumps(challenge_context, sort_keys=True)}
+
+Pruned web workflow context:
+{json.dumps(workflow_context, sort_keys=True)}
+"""
+    return _parse_graphql_plan(call_openai(prompt, require_deep_reasoning=True))
 
 
 def identify_web_subtype(chal_ID: int) -> str:
@@ -41,10 +181,10 @@ def identify_web_subtype(chal_ID: int) -> str:
     web_context = pruned_web_context(chal_ID)
     prompt = f"""You are classifying a web CTF challenge for a workflow dispatcher.
 
-Read the challenge context below and identify its subtype. The only currently
-supported subtype is SSTI (server-side template injection). Return exactly one
-token: SSTI if the context indicates an SSTI challenge; otherwise return
-UNKNOWN. Do not explain your answer.
+Read the challenge context below and identify its subtype. Supported subtypes
+are SSTI (server-side template injection) and GRAPHQL (a GraphQL API using
+queries or mutations). Return exactly one token: SSTI, GRAPHQL, or UNKNOWN.
+Do not explain your answer.
 
 Challenge ID: {chal_ID}
 Challenge context:
@@ -261,7 +401,10 @@ def _solve_ssti(chal_ID: int) -> str | None:
                     **observation,
                 }
             )
-        flag = next((extract_flag(response.text) for response in responses), None)
+        flag = next(
+            (found for response in responses if (found := _extract_response_flag(response))),
+            None,
+        )
         evidence = [item for record in response_records for item in record["evidence"]]
         append_web_node(
             chal_ID,
@@ -290,6 +433,173 @@ def _solve_ssti(chal_ID: int) -> str | None:
     return None
 
 
+def _graphql_response_records(
+    plan_operations: list[dict[str, object]],
+    operation_run: object,
+) -> tuple[list[dict[str, object]], list[str]]:
+    """Convert bounded GraphQL results into compact web-context observations."""
+    results = getattr(operation_run, "results", ())
+    records: list[dict[str, object]] = []
+    evidence: list[str] = []
+    for result in results:
+        analysis = getattr(result, "analysis", {})
+        payload = getattr(result, "payload", {})
+        executed_operation = getattr(result, "operation", None)
+        if (
+            not isinstance(analysis, dict)
+            or not isinstance(payload, dict)
+            or not isinstance(executed_operation, GraphQLOperation)
+        ):
+            continue
+        planned = next(
+            (
+                candidate
+                for candidate in plan_operations
+                if candidate["query"] == executed_operation.query
+                and candidate["variables"] == executed_operation.variables
+                and candidate["operation_name"] == executed_operation.operation_name
+            ),
+            None,
+        )
+        purpose = planned["purpose"] if planned is not None else "Executed CTF operation"
+        response_evidence = analysis.get("evidence", [])
+        if isinstance(response_evidence, list):
+            evidence.extend(item for item in response_evidence if isinstance(item, str))
+        records.append(
+            {
+                "field": {
+                    "query": executed_operation.query,
+                    "variables": executed_operation.variables,
+                    "operation_name": executed_operation.operation_name,
+                },
+                "purpose": purpose,
+                "classification": analysis.get("classification"),
+                "fingerprint": analysis.get("fingerprint"),
+                "suggestions": analysis.get("suggestions", []),
+                "required_arguments": analysis.get("required_arguments", []),
+                "returned_facts": analysis.get("returned_facts", []),
+                "text": json.dumps(payload, ensure_ascii=False, sort_keys=True)[:4000],
+                "evidence": response_evidence,
+            }
+        )
+    return records, list(dict.fromkeys(evidence))
+
+
+def _solve_graphql(chal_ID: int) -> str | None:
+    """Run an evidence-gated GraphQL workflow against one authorized CTF URL."""
+    challenge_url = get_challenge_url(chal_ID)
+    session = create_session()
+    probe_result = find_graphql_endpoint(session, challenge_url)
+    if probe_result is None:
+        append_web_node(
+            chal_ID,
+            parent_id=get_web_context(chal_ID)["active_node_id"],
+            inference="No same-origin GraphQL endpoint was confirmed by the read-only probe.",
+            field_vars_to_test=[],
+            responses=[],
+            subsequent_steps=["Stop this GraphQL workflow without sending planned operations."],
+            phase="root_field_discovery",
+            status="endpoint_not_found",
+        )
+        return None
+
+    probe_analysis = probe_result.analysis
+    append_web_node(
+        chal_ID,
+        parent_id=get_web_context(chal_ID)["active_node_id"],
+        inference="The same-origin endpoint returned a structurally valid GraphQL response.",
+        field_vars_to_test=[
+            {
+                "query": probe_result.operation.query,
+                "variables": probe_result.operation.variables,
+                "operation_name": probe_result.operation.operation_name,
+            }
+        ],
+        responses=[
+            {
+                "field": {"query": probe_result.operation.query},
+                "classification": probe_analysis.get("classification"),
+                "text": json.dumps(probe_result.payload, ensure_ascii=False, sort_keys=True)[:4000],
+                "evidence": probe_analysis.get("evidence", []),
+            }
+        ],
+        subsequent_steps=["Plan the smallest evidence-gated GraphQL operations."],
+        phase="root_field_discovery",
+        evidence=probe_analysis.get("evidence", []),
+    )
+
+    for iteration in range(1, MAX_GRAPHQL_ITERATIONS + 1):
+        plan = _ask_for_graphql_plan(chal_ID, probe_result.endpoint)
+        planned_operations = plan["operations"]
+        assert isinstance(planned_operations, list)
+        if len(planned_operations) > MAX_GRAPHQL_OPERATIONS_PER_ITERATION:
+            print(
+                f"[web][GRAPHQL] Iteration {iteration} suggested "
+                f"{len(planned_operations)} operations; capping at "
+                f"{MAX_GRAPHQL_OPERATIONS_PER_ITERATION}."
+            )
+            planned_operations = planned_operations[:MAX_GRAPHQL_OPERATIONS_PER_ITERATION]
+        if not planned_operations:
+            append_web_node(
+                chal_ID,
+                parent_id=get_web_context(chal_ID)["active_node_id"],
+                inference=str(plan["hypothesis"]),
+                field_vars_to_test=[],
+                responses=[],
+                subsequent_steps=[str(plan["fallback"])],
+                phase=str(plan["phase"]),
+                status="stalled",
+            )
+            return None
+
+        operations = [
+            GraphQLOperation(
+                query=str(operation["query"]),
+                variables=operation["variables"],  # type: ignore[arg-type]
+                operation_name=operation["operation_name"],  # type: ignore[arg-type]
+            )
+            for operation in planned_operations
+        ]
+        operation_run = run_graphql_operations_at_endpoint(
+            session,
+            probe_result.endpoint,
+            operations,
+        )
+        response_records, evidence = _graphql_response_records(
+            planned_operations,
+            operation_run,
+        )
+        print(
+            f"[web][GRAPHQL] Iteration {iteration}: phase={plan['phase']} "
+            f"stop_reason={operation_run.stop_reason}"
+        )
+        append_web_node(
+            chal_ID,
+            parent_id=get_web_context(chal_ID)["active_node_id"],
+            inference=str(plan["hypothesis"]),
+            field_vars_to_test=planned_operations,
+            responses=response_records,
+            subsequent_steps=[str(plan["advance_when"]), str(plan["fallback"])],
+            phase=str(plan["phase"]),
+            evidence=evidence,
+            status="flag_found" if operation_run.flag else "active",
+        )
+        if operation_run.flag:
+            return operation_run.flag
+        if has_recent_evidence_stall(chal_ID, MAX_GRAPHQL_NO_PROGRESS_ITERATIONS):
+            stopped_context = get_web_context(chal_ID)
+            stopped_node = stopped_context["nodes"][stopped_context["active_node_id"]]
+            stopped_node["status"] = "no_progress"
+            upsert_web_node(chal_ID, stopped_node)
+            return None
+
+    final_context = get_web_context(chal_ID)
+    final_node = final_context["nodes"][final_context["active_node_id"]]
+    final_node["status"] = "iteration_limit"
+    upsert_web_node(chal_ID, final_node)
+    return None
+
+
 def web_chal_solver(chal_ID: int) -> str | None:
     """Classify a web challenge, then dispatch to its subtype workflow."""
     reset_web_context(chal_ID)
@@ -298,14 +608,16 @@ def web_chal_solver(chal_ID: int) -> str | None:
     print(f"[web] Challenge {chal_ID} file path: {get_chal_file_path(chal_ID)!r}")
     subtype = identify_web_subtype(chal_ID)
     print(f"[web] Challenge {chal_ID} subtype: {subtype}")
-    if subtype != "SSTI":
+    if subtype not in WEB_CHALLENGE_SUBTYPES:
         print(f"[web] No workflow is implemented for subtype {subtype}.")
         return None
 
     try:
-        return _solve_ssti(chal_ID)
+        if subtype == "SSTI":
+            return _solve_ssti(chal_ID)
+        return _solve_graphql(chal_ID)
     except (requests.RequestException, ValueError, TypeError) as exc:
-        print(f"[web] Challenge {chal_ID} form workflow failed: {exc}")
+        print(f"[web] Challenge {chal_ID} {subtype} workflow failed: {exc}")
     return None   
 
 def main():

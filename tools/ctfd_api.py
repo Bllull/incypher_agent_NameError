@@ -120,14 +120,26 @@ def extract_challenge_description(
 def identify_challenge_type(
     challenge_id: int, details: ChallengeDetails | None = None
 ) -> Literal["file", "url", "tcp"]:
-    """Classify files first, then HTTP descriptions, then remaining TCP tasks."""
+    """Classify raw CTFd details or normalized stored challenge context."""
     record = _details_or_fetch(challenge_id, details)
-    files = record.get("files")
+    files = record.get("files", record.get("file_links"))
     if isinstance(files, list) and files:
         return "file"
+
     description = record.get("description", "")
-    if isinstance(description, str) and "http" in description.lower():
+    category = record.get("category", "")
+    web_text = " ".join(
+        value.lower() for value in (description, category) if isinstance(value, str)
+    )
+    web_markers = ("http://", "https://", "ssti", "jinja", "web challenge")
+    if "web" in str(category).lower() or any(
+        marker in web_text for marker in web_markers
+    ):
         return "url"
+
+    stored_type = record.get("challenge_type")
+    if stored_type in {"file", "url", "tcp"}:
+        return stored_type
     return "tcp"
 
 
@@ -141,6 +153,7 @@ def prepare_challenge_context(
     file_links = details.get("files", [])
     context: ChallengeDetails = {
         "name": retrieved_name or listed_name,
+        "category": details.get("category", ""),
         "description": description,
         "challenge_type": challenge_type,
         "file_links": file_links if isinstance(file_links, list) else [],

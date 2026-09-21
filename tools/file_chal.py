@@ -12,6 +12,10 @@ from typing import Any
 import base64
 import json
 import mimetypes
+import os
+import stat
+import zipfile
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -21,9 +25,37 @@ from tools.file_solve_tools import FileToolRequest, FileToolResult, execute_file
 from tools.flags import extract_flag, extract_flag_from_json
 
 _FILE_TOOL_NAMES = {"inspect", "gdb", "wireshark", "ghidra", "cyberchef"}
-_FILE_ACTIONS = _FILE_TOOL_NAMES | {"extract_zip", "convert_audio", "run_executable"}
+_FILE_ACTIONS = _FILE_TOOL_NAMES | {
+    "analyze_image",
+    "extract_zip",
+    "convert_audio",
+    "run_executable",
+}
 MAX_FILE_TOOL_HISTORY = 16
 MAX_EVIDENCE_CHARS = 6_000
+MAX_FILE_SOLVER_TURNS = 20
+MAX_IMAGE_ANALYSIS_BYTES = 10 * 1024 * 1024
+DEFAULT_EXECUTABLE_SESSION_SECONDS = 180.0
+MAX_EXECUTABLE_SESSION_SECONDS = 600.0
+_SUPPORTED_IMAGE_MIME_TYPES = {"image/gif", "image/jpeg", "image/png", "image/webp"}
+_WORKSPACE_ROOT = Path(__file__).resolve().parent.parent
+
+
+@dataclass
+class _LiveExecutableSession:
+    """One process session retained only for the current solver invocation."""
+
+    client_session_id: str
+    artifact_path: str
+
+
+@dataclass
+class _ExecutableRuntime:
+    """In-memory executable sessions; never persisted to challenge context."""
+
+    client: Any | None = None
+    sessions: dict[str, _LiveExecutableSession] = field(default_factory=dict)
+    next_handle: int = 1
 
 
 def call_openai(*args: Any, **kwargs: Any) -> str:
@@ -31,6 +63,13 @@ def call_openai(*args: Any, **kwargs: Any) -> str:
     from tools.llm_router import call_openai as configured_call_openai
 
     return configured_call_openai(*args, **kwargs)
+
+
+def call_multimodal_openai(*args: Any, **kwargs: Any) -> str:
+    """Load the configured vision client only when image evidence is requested."""
+    from tools.llm_router import call_multimodal_openai as configured_call_multimodal_openai
+
+    return configured_call_multimodal_openai(*args, **kwargs)
 
 
 def _paths(context: dict[str, Any]) -> list[Path]:
@@ -66,8 +105,73 @@ def _artifact_inventory(paths: list[Path]) -> list[dict[str, object]]:
     return inventory
 
 
+def _is_supported_image(path: str) -> bool:
+    mime_type, _ = mimetypes.guess_type(path)
+    return mime_type in _SUPPORTED_IMAGE_MIME_TYPES
+
+
+def _unextracted_zip_paths(artifacts: list[Path], context: dict[str, Any]) -> list[str]:
+    """Return ZIP artifacts that the solver has not successfully expanded yet."""
+    recorded = context.get("extracted_zip_paths", [])
+    extracted = {
+        str(Path(path).resolve())
+        for path in recorded
+        if isinstance(path, str)
+    } if isinstance(recorded, list) else set()
+    pending: list[str] = []
+    for path in artifacts:
+        resolved = str(path.resolve())
+        try:
+            is_zip = zipfile.is_zipfile(path)
+        except OSError:
+            continue
+        if resolved not in extracted and is_zip:
+            pending.append(resolved)
+    return pending
+
+
+def _register_executables(artifacts: list[Path], context: dict[str, Any], chal_ID: int) -> dict[str, Any]:
+    """Register ELF/PE artifacts only after every discovered ZIP is expanded."""
+    pending_archives = _unextracted_zip_paths(artifacts, context)
+    executables: list[str] = []
+    if not pending_archives:
+        for path in artifacts:
+            try:
+                path.relative_to(_WORKSPACE_ROOT)
+                with path.open("rb") as artifact:
+                    magic = artifact.read(4)
+                if not (magic == b"\x7fELF" or magic[:2] == b"MZ"):
+                    continue
+                path.chmod(path.stat().st_mode | stat.S_IXUSR)
+            except (OSError, ValueError):
+                continue
+            executables.append(str(path))
+
+    previous = context.get("allowed_executables", [])
+    workspace = str(_WORKSPACE_ROOT)
+    if (
+        previous != executables
+        or context.get("executable_workspace_root") != workspace
+        or context.get("pending_zip_extractions") != pending_archives
+    ):
+        update_context(
+            {
+                "allowed_executables": executables,
+                "executable_workspace_root": workspace,
+                "pending_zip_extractions": pending_archives,
+            },
+            chal_ID,
+        )
+    return {
+        **context,
+        "allowed_executables": executables,
+        "executable_workspace_root": workspace,
+        "pending_zip_extractions": pending_archives,
+    }
+
+
 def _configured_executable_client(context: dict[str, Any]) -> Any | None:
-    """Build a process client only when an explicit challenge allowlist exists."""
+    """Build a process client only when prepared challenge executables exist."""
     raw = context.get("allowed_executables", [])
     if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
         return None
@@ -81,7 +185,86 @@ def _configured_executable_client(context: dict[str, Any]) -> Any | None:
     except ModuleNotFoundError as exc:
         print(f"[file] Executable tool unavailable: {exc}")
         return None
-    return ExecutableClient(ProcessPolicy(workspace_root=workspace, allowed_executables=paths))
+    return ExecutableClient(
+        ProcessPolicy(
+            workspace_root=workspace,
+            allowed_executables=paths,
+            max_runtime_seconds=_executable_session_lifetime(),
+        )
+    )
+
+
+def _executable_session_lifetime() -> float:
+    """Read the bounded wall-clock lifetime for one interactive executable session."""
+    raw = os.getenv("FILE_SOLVER_EXECUTABLE_SESSION_SECONDS", "").strip()
+    if not raw:
+        return DEFAULT_EXECUTABLE_SESSION_SECONDS
+    try:
+        lifetime = float(raw)
+    except ValueError as exc:
+        raise ValueError("FILE_SOLVER_EXECUTABLE_SESSION_SECONDS must be numeric") from exc
+    if not 15.0 <= lifetime <= MAX_EXECUTABLE_SESSION_SECONDS:
+        raise ValueError(
+            "FILE_SOLVER_EXECUTABLE_SESSION_SECONDS must be between 15 and "
+            f"{MAX_EXECUTABLE_SESSION_SECONDS:g} seconds"
+        )
+    return lifetime
+
+
+def _executable_session(runtime: _ExecutableRuntime, handle: object, artifact_path: str) -> tuple[str, _LiveExecutableSession]:
+    """Resolve a logical session handle and ensure it matches the selected artifact."""
+    if not isinstance(handle, str):
+        raise ValueError("run_executable session must be a string handle")
+    session = runtime.sessions.get(handle)
+    if session is None:
+        raise ValueError("run_executable session is unknown or already closed")
+    if session.artifact_path != artifact_path:
+        raise ValueError("run_executable session does not belong to this artifact")
+    return handle, session
+
+
+def _executable_result(
+    *,
+    tool: str,
+    artifact_path: str,
+    handle: str,
+    runtime: _ExecutableRuntime,
+    output: bytes = b"",
+    error: Exception | None = None,
+) -> FileToolResult:
+    """Return process output and its complete bounded transcript as tool evidence."""
+    session = runtime.sessions.get(handle)
+    transcript = []
+    if runtime.client is not None and session is not None:
+        transcript = list(runtime.client.get_transcript(session.client_session_id))
+    result: dict[str, object] = {
+        "session": handle,
+        "output_text": output.decode("utf-8", errors="replace"),
+        "output_b64": base64.b64encode(output).decode("ascii"),
+        "transcript": transcript,
+    }
+    if error is not None:
+        result["error"] = str(error)
+    return FileToolResult(
+        tool=tool,
+        artifact_path=artifact_path,
+        status="error" if error is not None else "ok",
+        output=result,
+        flag=extract_flag(str(result["output_text"])),
+    )
+
+
+def _close_executable_sessions(runtime: _ExecutableRuntime) -> None:
+    """Terminate every live local process at the end of a solver invocation."""
+    if runtime.client is None:
+        return
+    for handle, session in list(runtime.sessions.items()):
+        try:
+            runtime.client.close(session.client_session_id)
+        except Exception:
+            pass
+        finally:
+            runtime.sessions.pop(handle, None)
 
 
 def _bounded_evidence(value: object) -> dict[str, object]:
@@ -151,7 +334,12 @@ def _parse_action(raw_plan: str, artifact_paths: list[Path]) -> tuple[dict[str, 
     return {"tool": tool, "artifact_path": str(path), "arguments": arguments}, hypothesis
 
 
-def _execute_action(action: dict[str, object], chal_ID: int, context: dict[str, Any]) -> FileToolResult:
+def _execute_action(
+    action: dict[str, object],
+    chal_ID: int,
+    context: dict[str, Any],
+    runtime: _ExecutableRuntime,
+) -> FileToolResult:
     """Execute one agent action using the module that owns that capability."""
     tool = str(action["tool"])
     artifact_path = str(action["artifact_path"])
@@ -162,6 +350,10 @@ def _execute_action(action: dict[str, object], chal_ID: int, context: dict[str, 
             return execute_file_tool(FileToolRequest(tool, artifact_path, arguments), chal_ID=chal_ID)
         if tool == "extract_zip":
             extracted = extract_zip_archive(artifact_path, chal_ID=chal_ID)
+            previous = context.get("extracted_zip_paths", [])
+            archives = [path for path in previous if isinstance(path, str)] if isinstance(previous, list) else []
+            if artifact_path not in archives:
+                update_context({"extracted_zip_paths": [*archives, artifact_path]}, chal_ID)
             return FileToolResult(
                 tool=tool,
                 artifact_path=artifact_path,
@@ -183,59 +375,201 @@ def _execute_action(action: dict[str, object], chal_ID: int, context: dict[str, 
                 artifact_paths=(str(output_path.resolve()),),
             )
 
-        client = _configured_executable_client(context)
-        if client is None:
-            raise RuntimeError("run_executable requires an explicit executable allowlist")
-        command_arguments = arguments.get("arguments", [])
-        stdin = arguments.get("stdin", "")
-        max_bytes = arguments.get("max_bytes", 4096)
-        timeout = arguments.get("timeout", 5.0)
-        if not isinstance(command_arguments, list) or not all(isinstance(item, str) for item in command_arguments):
-            raise ValueError("run_executable arguments must be a list of strings")
-        if not isinstance(stdin, str):
-            raise ValueError("run_executable stdin must be a string")
-        if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 4096:
-            raise ValueError("run_executable max_bytes must be between 1 and 4096")
-        if not isinstance(timeout, (int, float)) or not 0 < timeout <= 15:
-            raise ValueError("run_executable timeout must be between 0 and 15")
-        session_id = client.launch(Path(artifact_path), command_arguments)
-        try:
-            if stdin:
-                send = client.send_line if bool(arguments.get("send_line", False)) else client.send
-                send(session_id, stdin.encode())
-            output = client.receive(session_id, max_bytes, float(timeout))
-            text = output.decode("utf-8", errors="replace")
+        if tool == "analyze_image":
+            if not _is_supported_image(artifact_path):
+                raise ValueError("analyze_image requires a JPEG, PNG, GIF, or WebP artifact")
+            if Path(artifact_path).stat().st_size > MAX_IMAGE_ANALYSIS_BYTES:
+                raise ValueError(
+                    f"analyze_image supports images up to {MAX_IMAGE_ANALYSIS_BYTES} bytes"
+                )
+            question = arguments.get("question", "")
+            if not isinstance(question, str) or len(question) > 1_000:
+                raise ValueError("analyze_image question must be a string of at most 1000 characters")
+            challenge_description = context.get("description", "")
+            description = challenge_description if isinstance(challenge_description, str) else ""
+            prompt = f"""Analyze this local image for an explicitly authorized InCypher CTF file challenge.
+Describe concrete, solver-relevant observations such as visible text, encoding clues,
+steganographic indicators, or a flag. Do not invent a flag; report one only if it is
+visible or directly recoverable from the image.
+
+Challenge description:
+{description}
+
+Requested focus:
+{question or "Identify the most useful next forensic or decoding step."}"""
+            analysis = call_multimodal_openai(prompt, [artifact_path])
             return FileToolResult(
                 tool=tool,
                 artifact_path=artifact_path,
                 status="ok",
-                output={
-                    "output_text": text,
-                    "output_b64": base64.b64encode(output).decode("ascii"),
-                    "transcript": list(client.get_transcript(session_id)),
-                },
-                flag=extract_flag(text),
+                output={"analysis": analysis},
+                flag=extract_flag(analysis),
             )
-        finally:
-            client.close(session_id)
-    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+
+        operation = arguments.get("operation")
+        if operation not in {"start", "send", "receive", "close"}:
+            raise ValueError("run_executable requires operation: start, send, receive, or close")
+
+        if operation == "start":
+            command_arguments = arguments.get("arguments", [])
+            stdin = arguments.get("stdin", "")
+            if not isinstance(command_arguments, list) or not all(isinstance(item, str) for item in command_arguments):
+                raise ValueError("run_executable start arguments must be a list of strings")
+            if not isinstance(stdin, str):
+                raise ValueError("run_executable start stdin must be a string")
+            read_output = arguments.get("read_output", False)
+            if not isinstance(read_output, bool):
+                raise ValueError("run_executable start read_output must be a boolean")
+            if runtime.client is None:
+                runtime.client = _configured_executable_client(context)
+            if runtime.client is None:
+                raise RuntimeError("run_executable requires a registered executable artifact")
+            client_session_id = runtime.client.launch(Path(artifact_path), command_arguments)
+            handle = f"exec-{runtime.next_handle}"
+            runtime.next_handle += 1
+            runtime.sessions[handle] = _LiveExecutableSession(client_session_id, artifact_path)
+            try:
+                if stdin:
+                    send = runtime.client.send_line if bool(arguments.get("send_line", False)) else runtime.client.send
+                    send(client_session_id, stdin.encode())
+                if not read_output:
+                    return _executable_result(
+                        tool=tool,
+                        artifact_path=artifact_path,
+                        handle=handle,
+                        runtime=runtime,
+                    )
+                max_bytes = arguments.get("max_bytes", 4096)
+                timeout = arguments.get("timeout", 5.0)
+                if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 4096:
+                    raise ValueError("run_executable max_bytes must be between 1 and 4096")
+                if not isinstance(timeout, (int, float)) or not 0 < timeout <= 15:
+                    raise ValueError("run_executable timeout must be between 0 and 15")
+                output = runtime.client.receive(client_session_id, max_bytes, float(timeout))
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                    output=output,
+                )
+            except Exception as exc:
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                    error=exc,
+                )
+
+        handle, session = _executable_session(runtime, arguments.get("session"), artifact_path)
+        if runtime.client is None:
+            raise RuntimeError("run_executable runtime is unavailable")
+        if operation == "send":
+            stdin = arguments.get("stdin", "")
+            if not isinstance(stdin, str):
+                raise ValueError("run_executable send stdin must be a string")
+            try:
+                send = runtime.client.send_line if bool(arguments.get("send_line", False)) else runtime.client.send
+                send(session.client_session_id, stdin.encode())
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                )
+            except Exception as exc:
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                    error=exc,
+                )
+        if operation == "receive":
+            max_bytes = arguments.get("max_bytes", 4096)
+            timeout = arguments.get("timeout", 5.0)
+            delimiter = arguments.get("until")
+            if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 4096:
+                raise ValueError("run_executable max_bytes must be between 1 and 4096")
+            if not isinstance(timeout, (int, float)) or not 0 < timeout <= 15:
+                raise ValueError("run_executable timeout must be between 0 and 15")
+            if delimiter is not None and (
+                not isinstance(delimiter, str) or not delimiter or len(delimiter.encode()) > 512
+            ):
+                raise ValueError("run_executable receive until must be a non-empty string up to 512 bytes")
+            try:
+                output = (
+                    runtime.client.receive_until(
+                        session.client_session_id, delimiter.encode(), max_bytes, float(timeout)
+                    )
+                    if delimiter is not None
+                    else runtime.client.receive(session.client_session_id, max_bytes, float(timeout))
+                )
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                    output=output,
+                )
+            except Exception as exc:
+                return _executable_result(
+                    tool=tool,
+                    artifact_path=artifact_path,
+                    handle=handle,
+                    runtime=runtime,
+                    error=exc,
+                )
+
+        runtime.client.close(session.client_session_id)
+        result = _executable_result(
+            tool=tool,
+            artifact_path=artifact_path,
+            handle=handle,
+            runtime=runtime,
+        )
+        runtime.sessions.pop(handle, None)
+        return result
+    except Exception as exc:
         return FileToolResult(tool=tool, artifact_path=artifact_path, status="error", output={"error": str(exc)})
 
 
 def _ask_for_action(chal_ID: int, context: dict[str, Any], inventory: list[dict[str, object]]) -> str:
     """Request one evidence-gated action; results are supplied on the next loop."""
+    raw_executables = context.get("allowed_executables", [])
+    allowed_executables = (
+        [path for path in raw_executables if isinstance(path, str)]
+        if isinstance(raw_executables, list)
+        else []
+    )
+    raw_pending_archives = context.get("pending_zip_extractions", [])
+    pending_archives = (
+        [path for path in raw_pending_archives if isinstance(path, str)]
+        if isinstance(raw_pending_archives, list)
+        else []
+    )
     prompt = f"""You are solving an explicitly authorized local file-based InCypher CTF.
-Choose exactly one action from inspect, extract_zip, convert_audio,
+Choose exactly one action from inspect, analyze_image, extract_zip, convert_audio,
 run_executable, gdb, wireshark, ghidra, cyberchef. Use only an exact
 artifact_path listed in the inventory. The recent tool evidence is factual;
 choose a different method when a prior result did not support its hypothesis.
 
 Arguments:
 - inspect: optional {{"max_bytes": integer <= 65536}}
+- analyze_image: {{"question": "optional focused question, at most 1000 characters"}}
 - extract_zip: {{}}
 - convert_audio: {{"representation": "spectrogram" | "waveform"}}
-- run_executable: {{"arguments": [strings], "stdin": string, "send_line": boolean,
-  "max_bytes": integer <= 4096, "timeout": number <= 15}} (allowlisted files only)
+- run_executable: one session action, using only a registered executable path:
+  - start: {{"operation": "start", "arguments": [strings], "stdin": string,
+    "send_line": boolean, "read_output": boolean, "max_bytes": integer <= 4096,
+    "timeout": number <= 15}}. Returns a session handle. Set read_output only
+    when an immediate response is expected.
+  - send: {{"operation": "send", "session": "exec-N", "stdin": string,
+    "send_line": boolean}}
+  - receive: {{"operation": "receive", "session": "exec-N", "max_bytes": integer <= 4096,
+    "timeout": number <= 15, "until": "optional delimiter"}}
+  - close: {{"operation": "close", "session": "exec-N"}}
 - gdb: {{"operation": "file_info" | "functions" | "variables" | "disassemble",
   "symbol": "simple_symbol"}}
 - wireshark: {{"operation": "protocol_hierarchy" | "conversations" | "packet_fields",
@@ -255,6 +589,15 @@ Challenge context:
 Artifact inventory:
 {json.dumps(inventory, sort_keys=True)}
 
+Registered executables:
+{json.dumps(allowed_executables, sort_keys=True)}
+Pending ZIP extractions:
+{json.dumps(pending_archives, sort_keys=True)}
+Use extract_zip on every pending ZIP before selecting run_executable. Use
+run_executable only when its artifact_path is one of the registered paths.
+Executable session handles from prior tool evidence are valid only during this
+20-action solver invocation.
+
 Recent tool evidence:
 {json.dumps(_recent_tool_results(context), sort_keys=True, default=str)}
 """
@@ -262,44 +605,66 @@ Recent tool evidence:
 
 
 def file_chal_solver(chal_ID: int) -> str | None:
-    """Run internal LLM-selected tool turns until observed evidence yields a flag.
+    """Run up to 20 LLM-selected tool turns until observed evidence yields a flag.
 
     Each completed action is written to persistent challenge context before the
     following action is planned. The outer orchestrator sees only this method's
-    eventual flag or terminal failure, never individual tool turns.
+    eventual flag, terminal failure, or action limit, never individual tool turns.
     """
-    while True:
-        context = get_context(chal_ID) or {}
-        artifacts = _paths(context)
-        if not artifacts:
-            _planner_error(chal_ID, "No available file artifacts")
-            return None
-        inventory = _artifact_inventory(artifacts)
-        try:
-            action, hypothesis = _parse_action(
-                _ask_for_action(chal_ID, context, inventory), artifacts
-            )
-        except Exception as exc:
-            _planner_error(chal_ID, str(exc))
-            return None
-
-        result = _execute_action(action, chal_ID, context)
-        if result.flag is None:
-            flag = extract_flag_from_json(result.as_dict())
-            if flag:
-                result = FileToolResult(
-                    tool=result.tool,
-                    artifact_path=result.artifact_path,
-                    status=result.status,
-                    output=result.output,
-                    artifact_paths=result.artifact_paths,
-                    flag=flag,
+    runtime = _ExecutableRuntime()
+    try:
+        for _ in range(MAX_FILE_SOLVER_TURNS):
+            context = get_context(chal_ID) or {}
+            artifacts = _paths(context)
+            if not artifacts:
+                _planner_error(chal_ID, "No available file artifacts")
+                return None
+            context = _register_executables(artifacts, context, chal_ID)
+            inventory = _artifact_inventory(artifacts)
+            try:
+                action, hypothesis = _parse_action(
+                    _ask_for_action(chal_ID, context, inventory), artifacts
                 )
-        _record_result(chal_ID, result)
-        print(f"[file] Challenge {chal_ID} hypothesis: {hypothesis}")
-        print(f"[file] Challenge {chal_ID} {result.tool}: {result.status}")
-        if result.flag:
-            return result.flag
+            except Exception as exc:
+                _planner_error(chal_ID, str(exc))
+                return None
+
+            result = _execute_action(action, chal_ID, context, runtime)
+            if result.flag is None:
+                flag = extract_flag_from_json(result.as_dict())
+                if flag:
+                    result = FileToolResult(
+                        tool=result.tool,
+                        artifact_path=result.artifact_path,
+                        status=result.status,
+                        output=result.output,
+                        artifact_paths=result.artifact_paths,
+                        flag=flag,
+                    )
+            _record_result(chal_ID, result)
+            print(f"[file] Challenge {chal_ID} hypothesis: {hypothesis}")
+            print(f"[file] Challenge {chal_ID} {result.tool}: {result.status}")
+            if result.flag:
+                return result.flag
+
+        context = get_context(chal_ID) or {}
+        previous_state = context.get("file_solver_state", {})
+        state = previous_state if isinstance(previous_state, dict) else {}
+        update_context(
+            {
+                "file_solver_state": {
+                    **state,
+                    "last_status": "turn_limit_reached",
+                    "termination_reason": "No observed flag after 20 file-solver actions",
+                    "turns_this_attempt": MAX_FILE_SOLVER_TURNS,
+                }
+            },
+            chal_ID,
+        )
+        print(f"[file] Challenge {chal_ID} gave up after {MAX_FILE_SOLVER_TURNS} actions.")
+        return None
+    finally:
+        _close_executable_sessions(runtime)
 
 
 def file_chal_progress(chal_ID: int) -> dict[str, object]:

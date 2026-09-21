@@ -13,6 +13,7 @@ from tools.ctfd_api import (
     download_challenge_files,
     get_challenges,
     prepare_challenge_context,
+    submit_flag,
 )
 from tools.file_chal import file_chal_progress, file_chal_solver
 from tools.flags import extract_flag
@@ -98,6 +99,17 @@ def _record_challenge_error(chal_id: int, phase: str, error: Exception) -> None:
         print(f"[-] Could not persist error for [{chal_id}]: {record_error}")
 
 
+def _submission_was_rejected(response: dict[str, object]) -> bool:
+    """Recognize CTFd's explicit unsuccessful submission responses."""
+    if response.get("success") is False:
+        return True
+    data = response.get("data")
+    if not isinstance(data, dict):
+        return False
+    status = data.get("status")
+    return isinstance(status, str) and status.casefold() in {"incorrect", "invalid", "wrong"}
+
+
 def _prepare_pending_challenge(challenge: PendingChallenge) -> None:
     """Prepare context and required file assets, retaining partial downloads."""
     context = prepare_challenge_context(challenge.chal_id, challenge.name)
@@ -116,12 +128,12 @@ def _prepare_pending_challenge(challenge: PendingChallenge) -> None:
         and all(isinstance(path, str) and Path(path).is_file() for path in existing_paths)
     )
     if paths_are_complete:
-        return
-    file_paths = download_challenge_files(challenge.name, challenge.chal_id)
-    if not file_paths:
-        raise RuntimeError("No challenge files were downloaded")
-    update_context({"file_path": file_paths[0], "file_paths": file_paths}, challenge.chal_id)
-
+        file_paths = existing_paths
+    else:
+        file_paths = download_challenge_files(challenge.name, challenge.chal_id)
+        if not file_paths:
+            raise RuntimeError("No challenge files were downloaded")
+        update_context({"file_path": file_paths[0], "file_paths": file_paths}, challenge.chal_id)
 
 def _attempt(challenge: PendingChallenge) -> str | None:
     """Run one isolated preparation/delegation attempt and schedule its retry."""
@@ -137,10 +149,22 @@ def _attempt(challenge: PendingChallenge) -> str | None:
             f"as {challenge.challenge_type}."
         )
         flag = _delegate(challenge.challenge_type, challenge.chal_id)
+        if flag:
+            submission = submit_flag(challenge.chal_id, flag)
+            update_context(
+                {"last_flag_submission": {"flag": flag, "response": submission}},
+                challenge.chal_id,
+            )
+            if _submission_was_rejected(submission):
+                flag = None
+                raise RuntimeError("Platform rejected the submitted flag")
+            print(f"[+] Submitted flag for challenge [{challenge.chal_id}].")
     except ChallengeFileDownloadError as exc:
+        flag = None
         _record_challenge_error(challenge.chal_id, "file_download", exc)
         print(f"[-] Challenge [{challenge.chal_id}] file download incomplete: {exc}")
     except Exception as exc:
+        flag = None
         _record_challenge_error(challenge.chal_id, "attempt", exc)
         print(f"[-] Challenge [{challenge.chal_id}] {challenge.name} failed: {exc}")
 

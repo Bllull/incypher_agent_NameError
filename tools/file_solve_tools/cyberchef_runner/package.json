@@ -1,0 +1,9 @@
+{
+  "name": "incypher-cyberchef-runner",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Local, bounded CyberChef runner for InCypher file challenges.",
+  "dependencies": {
+    "cyberchef": "^10.19.4"
+  }
+}

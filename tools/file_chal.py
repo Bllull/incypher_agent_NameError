@@ -1,4 +1,4 @@
-"""Delegation shell for authorized file-based CTF challenges."""
+"""Evidence-driven LLM orchestration for local file-based CTF challenges."""
 
 from __future__ import annotations
 
@@ -9,495 +9,297 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tools.context import append_context_list, get_context, update_context
-from tools.executable_client import ExecutableClient, ExecutableClientError, ProcessPolicy
-from tools.flags import extract_flag
-from tools.send_logs import send_logs as print
+import base64
+import json
+import mimetypes
+from pathlib import Path
+from typing import Any
+
+from tools.context import get_context, update_context
+from tools.converter import SPECTROGRAM, WAVEFORM, convert_audio_file, extract_zip_archive
+from tools.file_solve_tools import FileToolRequest, FileToolResult, execute_file_tool
+from tools.flags import extract_flag, extract_flag_from_json
+
+_FILE_TOOL_NAMES = {"inspect", "gdb", "wireshark", "ghidra", "cyberchef"}
+_FILE_ACTIONS = _FILE_TOOL_NAMES | {"extract_zip", "convert_audio", "run_executable"}
+MAX_FILE_TOOL_HISTORY = 16
+MAX_EVIDENCE_CHARS = 6_000
 
 
-FileSolver = Callable[[int, dict[str, Any]], str | None]
-REV_SOLVER_MAX_PASSES = 5
-REV_ATTEMPT_HISTORY_LIMIT = 10
-REV_MAX_STATIC_CANDIDATES = 16
-REV_MAX_CANDIDATE_BYTES = 64
+def call_openai(*args: Any, **kwargs: Any) -> str:
+    """Load the configured LLM client only when an action needs planning."""
+    from tools.llm_router import call_openai as configured_call_openai
+
+    return configured_call_openai(*args, **kwargs)
 
 
-def _category_key(category: object) -> str:
-    """Normalize CTFd category labels without guessing an unsupported solver."""
-    if not isinstance(category, str):
-        return ""
-    return "".join(character for character in category.lower() if character.isalnum())
-
-
-def _not_implemented(kind: str, chal_ID: int, context: dict[str, Any]) -> None:
-    """Record a safe hand-off point for a future specialist file solver."""
+def _paths(context: dict[str, Any]) -> list[Path]:
     file_paths = context.get("file_paths", [])
-    print(f"[file][{kind}] Challenge {chal_ID} is awaiting its specialist solver.")
-    append_context_list(
-        [{"solver": kind, "event": "specialist_solver_unavailable", "file_count": len(file_paths) if isinstance(file_paths, list) else 0}],
-        "file_solver_attempts",
-        chal_ID,
-    )
+    if not isinstance(file_paths, list):
+        file_paths = []
+    converted_paths = context.get("converted_file_paths", [])
+    if not isinstance(converted_paths, list):
+        converted_paths = []
+    values: list[object] = [context.get("file_path"), *file_paths, *converted_paths]
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        path = Path(value).resolve()
+        if path.is_file() and path not in seen:
+            result.append(path)
+            seen.add(path)
+    return result
 
 
-def pwn_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
-    """Reserved handler for local binary-exploitation challenge artifacts."""
-    _not_implemented("pwn", chal_ID, context)
-    return None
-
-
-def rev_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
-    """Perform up to five bounded solve passes before yielding to the scheduler."""
-    paths = _challenge_paths(context)
-    if not paths:
-        _not_implemented("rev", chal_ID, context)
-        return None
-
-    prior_attempts = _rev_attempt_summaries(context)[-REV_ATTEMPT_HISTORY_LIMIT:]
-    known_probes = _known_probe_signatures(context)
-    analyzed_artifacts = _analyzed_artifact_hashes(context)
-    prior_passes = _recorded_rev_passes(context)
-    pass_records: list[dict[str, object]] = []
-    summaries: list[dict[str, object]] = []
-    for pass_number in range(1, REV_SOLVER_MAX_PASSES + 1):
-        print(
-            f"[rev] Challenge {chal_ID}: starting pass {pass_number}/"
-            f"{REV_SOLVER_MAX_PASSES} with {len(prior_attempts) + len(summaries)} prior summary/summaries."
-        )
-        flag, report = _run_rev_solver_pass(
-            chal_ID,
-            paths,
-            prior_attempts=[*prior_attempts, *summaries],
-            known_probes=known_probes,
-            analyzed_artifacts=analyzed_artifacts,
-        )
-        new_probe_entries = report.pop("new_probe_entries", [])
-        if isinstance(new_probe_entries, list):
-            known_probes.update(_probe_entry_signature(entry) for entry in new_probe_entries)
-            if new_probe_entries:
-                append_context_list(new_probe_entries, "rev_probe_ledger", chal_ID, unique=True)
-        ordinal = prior_passes + pass_number
-        pass_records.append(
-            {
-                "pass": ordinal,
-                "outcome": "flag_found" if flag else "no_flag",
-            }
-        )
-        summaries.append(
-            _describe_rev_pass(
-                ordinal=ordinal,
-                prior_attempt_count=len(prior_attempts) + len(summaries),
-                report=report,
-                flag_found=bool(flag),
-            )
-        )
-        print(f"[rev] Challenge {chal_ID}: {summaries[-1]['description']}")
-        if flag:
-            append_context_list(pass_records, "rev_solver_passes", chal_ID, unique=True)
-            _persist_rev_attempt_summaries(chal_ID, summaries)
-            return flag
-    append_context_list(pass_records, "rev_solver_passes", chal_ID, unique=True)
-    _persist_rev_attempt_summaries(chal_ID, summaries)
-    return None
-
-
-def _run_rev_solver_pass(
-    chal_ID: int,
-    paths: list[Path],
-    *,
-    prior_attempts: list[dict[str, object]],
-    known_probes: set[str],
-    analyzed_artifacts: set[str],
-) -> tuple[str | None, dict[str, object]]:
-    """Run one finite pass, carrying prior outcomes into the current solve call."""
-    report: dict[str, object] = {
-        "artifact_count": len(paths),
-        "prior_attempts_considered": len(prior_attempts),
-        "reconnaissance_completed": 0,
-        "executable_probe_paths": 0,
-        "overflow_probe_paths": 0,
-        "format_probe_paths": 0,
-        "static_candidate_probe_paths": 0,
-        "static_analysis_paths": 0,
-        "new_probe_entries": [],
-    }
-    print(
-        f"[rev] Challenge {chal_ID}: static reconnaissance of {len(paths)} local artifact(s)."
-    )
-    findings: list[dict[str, object]] = []
+def _artifact_inventory(paths: list[Path]) -> list[dict[str, object]]:
+    inventory: list[dict[str, object]] = []
     for path in paths:
-        finding, flag = _reconnaissance(path)
-        findings.append(finding)
-        report["reconnaissance_completed"] = int(report["reconnaissance_completed"]) + 1
-        if flag:
-            append_context_list(findings, "rev_reconnaissance", chal_ID, unique=True)
-            return flag, report
-    append_context_list(findings, "rev_reconnaissance", chal_ID, unique=True)
-
-    baseline_probe_ran = False
-    for path, finding in zip(paths, findings):
-        if not _is_locally_executable(path):
-            print(f"[rev] Skipping dynamic probes for non-executable artifact: {path.name}")
+        try:
+            size = path.stat().st_size
+        except OSError:
             continue
-        artifact_hash = _artifact_hash(finding)
-        payloads, entries = _unseen_probe_payloads(
-            artifact_hash, "basic_input", _HARMLESS_INPUTS, known_probes
-        )
-        if payloads:
-            print(f"[rev] Running bounded basic-input probes: {path.name}")
-            observations, flag = _probe_executable(path, payloads)
-            baseline_probe_ran = True
-            report["executable_probe_paths"] = int(report["executable_probe_paths"]) + 1
-            report["new_probe_entries"].extend(entries)
-            append_context_list(observations, "rev_input_observations", chal_ID, unique=True)
-            if flag:
-                return flag, report
-    for path, finding in zip(paths, findings):
-        triage = _exploit_triage(path, finding)
-        append_context_list([triage], "rev_exploit_triage", chal_ID, unique=True)
-        if not _is_locally_executable(path):
-            continue
-        artifact_hash = _artifact_hash(finding)
-        if triage["overflow_probe_eligible"]:
-            payloads, entries = _unseen_probe_payloads(
-                artifact_hash,
-                "overflow_boundary",
-                tuple(b"A" * length for length in _OVERFLOW_LENGTHS),
-                known_probes,
-            )
-            if payloads:
-                print(f"[rev] Running bounded overflow-boundary probes: {path.name}")
-                observations, flag = _run_input_probes(path, payloads, probe_type="overflow_boundary")
-                baseline_probe_ran = True
-                report["overflow_probe_paths"] = int(report["overflow_probe_paths"]) + 1
-                report["new_probe_entries"].extend(entries)
-                append_context_list(observations, "rev_overflow_observations", chal_ID, unique=True)
-                if flag:
-                    return flag, report
-        if triage["format_probe_eligible"]:
-            payloads, entries = _unseen_probe_payloads(
-                artifact_hash, "format_read", _FORMAT_READ_PROBES, known_probes
-            )
-            if payloads:
-                print(f"[rev] Running read-only format-string probes: {path.name}")
-                observations, flag = _run_input_probes(path, payloads, probe_type="format_read")
-                baseline_probe_ran = True
-                report["format_probe_paths"] = int(report["format_probe_paths"]) + 1
-                report["new_probe_entries"].extend(entries)
-                append_context_list(observations, "rev_format_observations", chal_ID, unique=True)
-                if flag:
-                    return flag, report
-    if not baseline_probe_ran:
-        for path, finding in zip(paths, findings):
-            artifact_hash = _artifact_hash(finding)
-            if artifact_hash in analyzed_artifacts:
-                continue
-            analysis = _static_rev_analysis(path, finding)
-            analyzed_artifacts.add(artifact_hash)
-            report["static_analysis_paths"] = int(report["static_analysis_paths"]) + 1
-            append_context_list([analysis], "rev_static_analysis", chal_ID, unique=True)
-            if not _is_locally_executable(path):
-                continue
-            candidates = _static_candidates(analysis)
-            payloads, entries = _unseen_probe_payloads(
-                artifact_hash, "static_candidate", candidates, known_probes
-            )
-            if not payloads:
-                continue
-            print(f"[rev] Verifying {len(payloads)} static candidate input(s): {path.name}")
-            observations, flag = _run_input_probes(path, payloads, probe_type="static_candidate")
-            report["static_candidate_probe_paths"] = int(report["static_candidate_probe_paths"]) + 1
-            report["new_probe_entries"].extend(entries)
-            append_context_list(observations, "rev_static_candidate_observations", chal_ID, unique=True)
-            if flag:
-                return flag, report
-    return None, report
+        mime, _ = mimetypes.guess_type(path.name)
+        inventory.append({"path": str(path), "name": path.name, "suffix": path.suffix.lower(),
+                          "mime_type": mime, "size": size})
+    return inventory
 
 
-def _rev_attempt_summaries(context: dict[str, Any]) -> list[dict[str, object]]:
-    """Read only well-formed persisted summaries for use in the next solve pass."""
-    values = context.get("rev_attempt_summaries", [])
-    if not isinstance(values, list):
+def _configured_executable_client(context: dict[str, Any]) -> Any | None:
+    """Build a process client only when an explicit challenge allowlist exists."""
+    raw = context.get("allowed_executables", [])
+    if not isinstance(raw, list) or not all(isinstance(item, str) for item in raw):
+        return None
+    paths = tuple(Path(item).resolve() for item in raw)
+    if not paths:
+        return None
+    root = context.get("executable_workspace_root")
+    workspace = Path(root).resolve() if isinstance(root, str) and root else Path.cwd().resolve()
+    try:
+        from tools.executable_client import ExecutableClient, ProcessPolicy
+    except ModuleNotFoundError as exc:
+        print(f"[file] Executable tool unavailable: {exc}")
+        return None
+    return ExecutableClient(ProcessPolicy(workspace_root=workspace, allowed_executables=paths))
+
+
+def _bounded_evidence(value: object) -> dict[str, object]:
+    """Produce JSON-safe, bounded durable evidence for the next LLM turn."""
+    encoded = json.dumps(value, sort_keys=True, default=str)
+    if len(encoded) <= MAX_EVIDENCE_CHARS and isinstance(value, dict):
+        return value
+    return {"truncated": True, "preview": encoded[:MAX_EVIDENCE_CHARS]}
+
+
+def _recent_tool_results(context: dict[str, Any]) -> list[dict[str, object]]:
+    results = context.get("file_tool_results", [])
+    if not isinstance(results, list):
         return []
-    return [value for value in values if isinstance(value, dict)]
+    return [item for item in results if isinstance(item, dict)][-MAX_FILE_TOOL_HISTORY:]
 
 
-def _persist_rev_attempt_summaries(chal_ID: int, summaries: list[dict[str, object]]) -> None:
-    """Keep only a bounded hand-off history; concrete evidence remains intact."""
-    existing = _rev_attempt_summaries(get_context(chal_ID) or {})
+def _record_result(chal_ID: int, result: FileToolResult) -> None:
+    """Save one completed action before the next LLM loop begins."""
+    context = get_context(chal_ID) or {}
+    history = [*_recent_tool_results(context), _bounded_evidence(result.as_dict())]
     update_context(
-        {"rev_attempt_summaries": [*existing, *summaries][-REV_ATTEMPT_HISTORY_LIMIT:]},
+        {
+            "file_tool_results": history[-MAX_FILE_TOOL_HISTORY:],
+            "file_solver_state": {
+                "last_tool": result.tool,
+                "last_status": result.status,
+                "last_artifact_path": result.artifact_path,
+                "last_flag": result.flag,
+            },
+        },
         chal_ID,
     )
 
 
-def _recorded_rev_passes(context: dict[str, Any]) -> int:
-    """Return the highest persisted pass number for stable pass labels."""
-    values = context.get("rev_solver_passes", [])
-    if not isinstance(values, list):
-        return 0
-    return max(
-        (value.get("pass", 0) for value in values if isinstance(value, dict) and isinstance(value.get("pass"), int)),
-        default=0,
+def _planner_error(chal_ID: int, message: str) -> None:
+    """Store malformed plans as evidence so the next turn can correct them."""
+    _record_result(
+        chal_ID,
+        FileToolResult(tool="planner", artifact_path="", status="error", output={"error": message}),
     )
 
 
-def _artifact_hash(finding: dict[str, object]) -> str:
-    """Return a stable artifact identity for deterministic probe caching."""
-    value = finding.get("sha256")
-    return value if isinstance(value, str) and value else "unknown-artifact"
+def _parse_action(raw_plan: str, artifact_paths: list[Path]) -> tuple[dict[str, object], str]:
+    """Validate one model-selected tool action against the current inventory."""
+    cleaned = raw_plan.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    plan = json.loads(cleaned)
+    if not isinstance(plan, dict):
+        raise ValueError("File solver plan must be a JSON object")
+    action = plan.get("action")
+    hypothesis = plan.get("hypothesis")
+    if not isinstance(action, dict) or not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError("File solver plan requires an action and non-empty hypothesis")
+    tool = action.get("tool")
+    artifact_path = action.get("artifact_path")
+    arguments = action.get("arguments", {})
+    if tool not in _FILE_ACTIONS:
+        raise ValueError(f"Unsupported file action: {tool!r}")
+    if not isinstance(artifact_path, str) or not isinstance(arguments, dict):
+        raise ValueError("File action requires artifact_path and object arguments")
+    path = Path(artifact_path).resolve()
+    if path not in {candidate.resolve() for candidate in artifact_paths}:
+        raise ValueError("File action must target an artifact in the inventory")
+    json.dumps(arguments)
+    return {"tool": tool, "artifact_path": str(path), "arguments": arguments}, hypothesis
 
 
-def _probe_entry_signature(entry: object) -> str:
-    """Canonicalize one ledger entry without retaining the probe payload itself."""
-    if not isinstance(entry, dict):
-        return ""
-    artifact_hash = entry.get("artifact_sha256")
-    probe_type = entry.get("probe_type")
-    payload_hash = entry.get("payload_sha256")
-    if not all(isinstance(value, str) for value in (artifact_hash, probe_type, payload_hash)):
-        return ""
-    return f"{artifact_hash}:{probe_type}:{payload_hash}"
+def _execute_action(action: dict[str, object], chal_ID: int, context: dict[str, Any]) -> FileToolResult:
+    """Execute one agent action using the module that owns that capability."""
+    tool = str(action["tool"])
+    artifact_path = str(action["artifact_path"])
+    arguments = action["arguments"]
+    assert isinstance(arguments, dict)
+    try:
+        if tool in _FILE_TOOL_NAMES:
+            return execute_file_tool(FileToolRequest(tool, artifact_path, arguments), chal_ID=chal_ID)
+        if tool == "extract_zip":
+            extracted = extract_zip_archive(artifact_path, chal_ID=chal_ID)
+            return FileToolResult(
+                tool=tool,
+                artifact_path=artifact_path,
+                status="ok",
+                output={"extracted_count": len(extracted)},
+                artifact_paths=tuple(str(path.resolve()) for path in extracted),
+            )
+        if tool == "convert_audio":
+            representation = arguments.get("representation")
+            conversion = {"spectrogram": SPECTROGRAM, "waveform": WAVEFORM}.get(representation)
+            if conversion is None:
+                raise ValueError("convert_audio requires 'spectrogram' or 'waveform'")
+            output_path = convert_audio_file(artifact_path, conversion, chal_ID=chal_ID)
+            return FileToolResult(
+                tool=tool,
+                artifact_path=artifact_path,
+                status="ok",
+                output={"representation": representation},
+                artifact_paths=(str(output_path.resolve()),),
+            )
+
+        client = _configured_executable_client(context)
+        if client is None:
+            raise RuntimeError("run_executable requires an explicit executable allowlist")
+        command_arguments = arguments.get("arguments", [])
+        stdin = arguments.get("stdin", "")
+        max_bytes = arguments.get("max_bytes", 4096)
+        timeout = arguments.get("timeout", 5.0)
+        if not isinstance(command_arguments, list) or not all(isinstance(item, str) for item in command_arguments):
+            raise ValueError("run_executable arguments must be a list of strings")
+        if not isinstance(stdin, str):
+            raise ValueError("run_executable stdin must be a string")
+        if not isinstance(max_bytes, int) or not 1 <= max_bytes <= 4096:
+            raise ValueError("run_executable max_bytes must be between 1 and 4096")
+        if not isinstance(timeout, (int, float)) or not 0 < timeout <= 15:
+            raise ValueError("run_executable timeout must be between 0 and 15")
+        session_id = client.launch(Path(artifact_path), command_arguments)
+        try:
+            if stdin:
+                send = client.send_line if bool(arguments.get("send_line", False)) else client.send
+                send(session_id, stdin.encode())
+            output = client.receive(session_id, max_bytes, float(timeout))
+            text = output.decode("utf-8", errors="replace")
+            return FileToolResult(
+                tool=tool,
+                artifact_path=artifact_path,
+                status="ok",
+                output={
+                    "output_text": text,
+                    "output_b64": base64.b64encode(output).decode("ascii"),
+                    "transcript": list(client.get_transcript(session_id)),
+                },
+                flag=extract_flag(text),
+            )
+        finally:
+            client.close(session_id)
+    except (OSError, TypeError, ValueError, RuntimeError) as exc:
+        return FileToolResult(tool=tool, artifact_path=artifact_path, status="error", output={"error": str(exc)})
 
 
-def _known_probe_signatures(context: dict[str, Any]) -> set[str]:
-    """Read the durable probe ledger without treating it as solver progress."""
-    values = context.get("rev_probe_ledger", [])
-    if not isinstance(values, list):
-        return set()
-    return {signature for value in values if (signature := _probe_entry_signature(value))}
+def _ask_for_action(chal_ID: int, context: dict[str, Any], inventory: list[dict[str, object]]) -> str:
+    """Request one evidence-gated action; results are supplied on the next loop."""
+    prompt = f"""You are solving an explicitly authorized local file-based InCypher CTF.
+Choose exactly one action from inspect, extract_zip, convert_audio,
+run_executable, gdb, wireshark, ghidra, cyberchef. Use only an exact
+artifact_path listed in the inventory. The recent tool evidence is factual;
+choose a different method when a prior result did not support its hypothesis.
 
+Arguments:
+- inspect: optional {{"max_bytes": integer <= 65536}}
+- extract_zip: {{}}
+- convert_audio: {{"representation": "spectrogram" | "waveform"}}
+- run_executable: {{"arguments": [strings], "stdin": string, "send_line": boolean,
+  "max_bytes": integer <= 4096, "timeout": number <= 15}} (allowlisted files only)
+- gdb: {{"operation": "file_info" | "functions" | "variables" | "disassemble",
+  "symbol": "simple_symbol"}}
+- wireshark: {{"operation": "protocol_hierarchy" | "conversations" | "packet_fields",
+  "display_filter": "optional", "max_packets": integer}}
+- ghidra: {{"operation": "summary" | "functions" | "strings"}}
+- cyberchef: {{"recipe": "operation name or saved recipe JSON"}}
 
-def _analyzed_artifact_hashes(context: dict[str, Any]) -> set[str]:
-    """Return artifact hashes that already completed the generic static pipeline."""
-    values = context.get("rev_static_analysis", [])
-    if not isinstance(values, list):
-        return set()
-    return {
-        value["artifact_sha256"]
-        for value in values
-        if isinstance(value, dict) and isinstance(value.get("artifact_sha256"), str)
-    }
+Return JSON only:
+{{"hypothesis": "brief evidence-based reason", "action": {{"tool": "allowed tool",
+"artifact_path": "exact inventory path", "arguments": {{}}}}}}
+Never return a speculative flag; flags must come from observed tool output.
 
+Challenge ID: {chal_ID}
+Challenge context:
+{json.dumps({key: value for key, value in context.items() if key not in {"file_tool_results", "solver_scheduler", "solver_errors"}}, sort_keys=True, default=str)}
 
-def _unseen_probe_payloads(
-    artifact_hash: str,
-    probe_type: str,
-    payloads: tuple[bytes, ...],
-    known_signatures: set[str],
-) -> tuple[tuple[bytes, ...], list[dict[str, str]]]:
-    """Select only payloads not already executed against this exact artifact."""
-    selected: list[bytes] = []
-    entries: list[dict[str, str]] = []
-    for payload in payloads:
-        payload_hash = hashlib.sha256(payload).hexdigest()
-        entry = {
-            "artifact_sha256": artifact_hash,
-            "probe_type": probe_type,
-            "payload_sha256": payload_hash,
-        }
-        signature = _probe_entry_signature(entry)
-        if signature in known_signatures:
-            continue
-        selected.append(payload)
-        entries.append(entry)
-        known_signatures.add(signature)
-    return tuple(selected), entries
+Artifact inventory:
+{json.dumps(inventory, sort_keys=True)}
 
-
-def _static_rev_analysis(path: Path, finding: dict[str, object]) -> dict[str, object]:
-    """Run evidence-gated, format-agnostic recognizers on one local CTF artifact."""
-    data = path.read_bytes()[:_MAX_RECON_BYTES]
-    strings = finding.get("strings", [])
-    text_strings = [value for value in strings if isinstance(value, str)]
-    recognizers = [
-        _recognize_state_machine(data, text_strings),
-        _recognize_hardcoded_comparator(text_strings),
-        _recognize_transform_or_hash(text_strings),
-        _recognize_encoding_or_vm(text_strings),
-    ]
-    candidates = [
-        candidate
-        for recognizer in recognizers
-        for candidate in recognizer.pop("candidate_inputs", [])
-        if isinstance(candidate, str)
-    ][:REV_MAX_STATIC_CANDIDATES]
-    return {
-        "path": str(path),
-        "artifact_sha256": _artifact_hash(finding),
-        "pipeline": ["format", "entrypoint", "strings", "recognizers", "candidate_verifier"],
-        "recognizers": recognizers,
-        "candidate_inputs": candidates,
-    }
-
-
-def _recognize_state_machine(data: bytes, strings: list[str]) -> dict[str, object]:
-    """Find small input alphabets and embedded transition-like candidate sequences."""
-    alphabet = ""
-    for value in strings:
-        match = re.search(r"\(([A-Za-z0-9](?:/[A-Za-z0-9]){1,15})\)", value)
-        if match:
-            alphabet = "".join(match.group(1).split("/"))
-            break
-    if not alphabet:
-        return {"name": "state_machine", "status": "no_small_alphabet_evidence"}
-    candidates = _alphabet_runs(data, alphabet)
-    return {
-        "name": "state_machine",
-        "status": "small_alphabet_evidence",
-        "alphabet": alphabet,
-        "candidate_inputs": candidates,
-    }
-
-
-def _alphabet_runs(data: bytes, alphabet: str) -> list[str]:
-    """Extract bounded printable runs over an evidenced alphabet for local verification."""
-    allowed = set(alphabet.encode("ascii", errors="ignore"))
-    candidates: list[str] = []
-    current = bytearray()
-    for value in data:
-        if value in allowed:
-            current.append(value)
-            continue
-        if 2 <= len(current) <= REV_MAX_CANDIDATE_BYTES:
-            candidate = current.decode("ascii")
-            if candidate not in candidates:
-                candidates.append(candidate)
-        current.clear()
-        if len(candidates) >= REV_MAX_STATIC_CANDIDATES:
-            break
-    if 2 <= len(current) <= REV_MAX_CANDIDATE_BYTES and len(candidates) < REV_MAX_STATIC_CANDIDATES:
-        candidate = current.decode("ascii")
-        if candidate not in candidates:
-            candidates.append(candidate)
-    return candidates
-
-
-def _recognize_hardcoded_comparator(strings: list[str]) -> dict[str, object]:
-    """Record comparator evidence without assuming a plaintext secret exists."""
-    markers = sorted({marker for marker in ("strcmp", "strncmp", "memcmp") if marker in "\n".join(strings).lower()})
-    return {
-        "name": "hardcoded_comparator",
-        "status": "evidence" if markers else "no_evidence",
-        "markers": markers,
-    }
-
-
-def _recognize_transform_or_hash(strings: list[str]) -> dict[str, object]:
-    """Record reversible-transform and digest evidence for later specialists."""
-    lowered = "\n".join(strings).lower()
-    transforms = sorted({marker for marker in ("xor", "encrypt", "decrypt", "rotate") if marker in lowered})
-    hashes = sorted({marker for marker in ("sha256", "sha-256", "md5", "sha1") if marker in lowered})
-    return {"name": "transform_or_hash", "status": "evidence" if transforms or hashes else "no_evidence", "transforms": transforms, "hashes": hashes}
-
-
-def _recognize_encoding_or_vm(strings: list[str]) -> dict[str, object]:
-    """Record encoding and interpreter-dispatch hints without executing them."""
-    lowered = "\n".join(strings).lower()
-    encodings = sorted({marker for marker in ("base64", "zlib", "gzip", "decode") if marker in lowered})
-    vm_markers = sorted({marker for marker in ("bytecode", "opcode", "interpreter", "virtual machine") if marker in lowered})
-    return {"name": "encoding_or_vm", "status": "evidence" if encodings or vm_markers else "no_evidence", "encodings": encodings, "vm_markers": vm_markers}
-
-
-def _static_candidates(analysis: dict[str, object]) -> tuple[bytes, ...]:
-    """Return bounded printable candidates emitted by the static recognizers."""
-    values = analysis.get("candidate_inputs", [])
-    if not isinstance(values, list):
-        return ()
-    return tuple(
-        value.encode("ascii")
-        for value in values[:REV_MAX_STATIC_CANDIDATES]
-        if isinstance(value, str) and 0 < len(value.encode("ascii", errors="ignore")) <= REV_MAX_CANDIDATE_BYTES
-    )
-
-
-def _describe_rev_pass(
-    *,
-    ordinal: int,
-    prior_attempt_count: int,
-    report: dict[str, object],
-    flag_found: bool,
-) -> dict[str, object]:
-    """Create a bounded hand-off summary for later solver and model calls."""
-    outcome = "An INCYPHER flag was recovered; stop further probing." if flag_found else (
-        "No flag was recovered in this bounded pass; preserve these results for the next pass."
-    )
-    description = (
-        f"Reverse-engineering pass {ordinal} considered {prior_attempt_count} prior attempt "
-        f"summary/summaries. It completed static reconnaissance on "
-        f"{report['reconnaissance_completed']} of {report['artifact_count']} artifact(s), then ran "
-        f"basic input probes on {report['executable_probe_paths']} executable(s), overflow-boundary "
-        f"probes on {report['overflow_probe_paths']} executable(s), and read-only format-string probes "
-        f"on {report['format_probe_paths']} executable(s). {outcome}"
-    )
-    return {
-        "pass": ordinal,
-        "outcome": "flag_found" if flag_found else "no_flag",
-        "description": description,
-        "report": report,
-    }
-
-
-def forensics_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
-    """Reserved handler for forensic challenge artifacts."""
-    _not_implemented("forensics", chal_ID, context)
-    return None
-
-
-def cryptography_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
-    """Reserved handler for cryptography challenge artifacts."""
-    _not_implemented("cryptography", chal_ID, context)
-    return None
-
-
-# Future specialist solvers only replace one handler; the agent remains generic.
-FILE_SOLVERS: dict[str, FileSolver] = {
-    "pwn": pwn_file_solver,
-    "rev": rev_file_solver,
-    "forensics": forensics_file_solver,
-    "cryptography": cryptography_file_solver,
-}
-CATEGORY_ALIASES = {
-    "pwn": "pwn",
-    "(Practice) pwn": "pwn",
-    "practicepwn": "pwn",
-    "binaryexploitation": "pwn",
-    "binary": "pwn",
-    "re": "rev",
-    "rev": "rev",
-    "(Practice) rev": "rev",
-    "practicerev": "rev",
-    "reverse": "rev",
-    "reversing": "rev",
-    "reverseengineering": "rev",
-    "forensics": "forensics",
-    "(Practice) forensics": "forensics",
-    "practiceforensics": "forensics",
-    "forensic": "forensics",
-    "crypto": "cryptography",
-    "(Practice) cryptography": "cryptography",
-    "cryptography": "cryptography",
-    "practicecrypto": "cryptography",
-    "practicecryptography": "cryptography",
-}
+Recent tool evidence:
+{json.dumps(_recent_tool_results(context), sort_keys=True, default=str)}
+"""
+    return call_openai(prompt, require_deep_reasoning=True)
 
 
 def file_chal_solver(chal_ID: int) -> str | None:
-    """Delegate one file challenge to its category-specific specialist solver."""
-    context = get_context(chal_ID)
-    if context is None:
-        print(f"[file] Challenge {chal_ID} has no prepared context.")
-        return None
-    category = CATEGORY_ALIASES.get(_category_key(context.get("category")))
-    if category is None:
-        print(f"[file] Challenge {chal_ID} has unsupported category: {context.get('category')!r}")
-        append_context_list(
-            [{"event": "unsupported_category", "category": str(context.get("category", ""))}],
-            "file_solver_attempts",
-            chal_ID,
-        )
-        return None
-    return FILE_SOLVERS[category](chal_ID, context)
+    """Run internal LLM-selected tool turns until observed evidence yields a flag.
+
+    Each completed action is written to persistent challenge context before the
+    following action is planned. The outer orchestrator sees only this method's
+    eventual flag or terminal failure, never individual tool turns.
+    """
+    while True:
+        context = get_context(chal_ID) or {}
+        artifacts = _paths(context)
+        if not artifacts:
+            _planner_error(chal_ID, "No available file artifacts")
+            return None
+        inventory = _artifact_inventory(artifacts)
+        try:
+            action, hypothesis = _parse_action(
+                _ask_for_action(chal_ID, context, inventory), artifacts
+            )
+        except Exception as exc:
+            _planner_error(chal_ID, str(exc))
+            return None
+
+        result = _execute_action(action, chal_ID, context)
+        if result.flag is None:
+            flag = extract_flag_from_json(result.as_dict())
+            if flag:
+                result = FileToolResult(
+                    tool=result.tool,
+                    artifact_path=result.artifact_path,
+                    status=result.status,
+                    output=result.output,
+                    artifact_paths=result.artifact_paths,
+                    flag=flag,
+                )
+        _record_result(chal_ID, result)
+        print(f"[file] Challenge {chal_ID} hypothesis: {hypothesis}")
+        print(f"[file] Challenge {chal_ID} {result.tool}: {result.status}")
+        if result.flag:
+            return result.flag
 
 
 def file_chal_progress(chal_ID: int) -> dict[str, object]:
@@ -508,6 +310,8 @@ def file_chal_progress(chal_ID: int) -> dict[str, object]:
         "file_path": context.get("file_path"),
         "file_paths": context.get("file_paths", []),
         "converted_file_paths": context.get("converted_file_paths", []),
+        "file_tool_results": _recent_tool_results(context),
+        "file_solver_state": context.get("file_solver_state", {}),
     }
 
 

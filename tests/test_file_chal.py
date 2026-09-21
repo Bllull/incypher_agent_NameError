@@ -1,173 +1,66 @@
-"""Offline tests for the file-challenge category delegator."""
+"""Offline tests for the file solver's internal tool/evidence loop."""
 
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from pathlib import Path
-import hashlib
-from tempfile import TemporaryDirectory
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
-from tools import file_chal
+from tools import context
+from tools.context import get_context, store_context
+from tools.file_solve_tools import FileToolResult
+from tools.file_chal import file_chal_progress, file_chal_solver
 
 
-class FileChallengeDelegationTests(unittest.TestCase):
-    """Ensure every supported category selects only its specialist handler."""
+class FileChallengeSolverTests(unittest.TestCase):
+    """Ensure tool evidence is durable before the next LLM decision."""
 
-    def test_category_aliases_cover_the_supported_file_solvers(self) -> None:
-        self.assertEqual(file_chal.CATEGORY_ALIASES["pwn"], "pwn")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["re"], "rev")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["reverseengineering"], "rev")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["forensic"], "forensics")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["crypto"], "cryptography")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["practicepwn"], "pwn")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["practicerev"], "rev")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["practiceforensics"], "forensics")
-        self.assertEqual(file_chal.CATEGORY_ALIASES["practicecryptography"], "cryptography")
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.database_patch = patch.object(context, "CONTEXT_DB_PATH", self.root / "context.sqlite3")
+        self.database_patch.start()
+        self.artifact = self.root / "challenge.txt"
+        self.artifact.write_text("offline fixture", encoding="utf-8")
+        store_context({"file_path": str(self.artifact), "file_paths": [str(self.artifact)]}, 77)
 
-    @patch("tools.file_chal.get_context")
-    def test_delegates_to_the_matching_specialist(self, get_context) -> None:
-        context = {"category": "Reverse Engineering", "file_paths": []}
-        get_context.return_value = context
-        handler = Mock(return_value="INCYPHER{harmless_fixture}")
-        with patch.dict(file_chal.FILE_SOLVERS, {"rev": handler}):
-            result = file_chal.file_chal_solver(55)
-        self.assertEqual(result, "INCYPHER{harmless_fixture}")
-        handler.assert_called_once_with(55, context)
+    def tearDown(self) -> None:
+        self.database_patch.stop()
+        self.temporary_directory.cleanup()
 
-    @patch("tools.file_chal.append_context_list")
-    @patch("tools.file_chal.get_context", return_value={"category": "misc"})
-    def test_unsupported_category_stays_unsolved(self, _get_context, append_attempt) -> None:
-        self.assertIsNone(file_chal.file_chal_solver(56))
-        append_attempt.assert_called_once()
-
-    @patch("tools.file_chal.append_context_list")
-    @patch("tools.file_chal.get_context", return_value={"category": "pwn", "file_paths": []})
-    def test_unimplemented_specialist_never_returns_a_synthetic_flag(
-        self, _get_context, append_attempt
-    ) -> None:
-        self.assertIsNone(file_chal.file_chal_solver(57))
-        append_attempt.assert_called_once()
-
-    def test_static_reconnaissance_finds_a_flag_location_without_execution(self) -> None:
-        fixture = Path(__file__).parent / "fixtures" / "rev_static_fixture.bin"
-        finding, flag = file_chal._reconnaissance(fixture)
-        self.assertEqual(flag, "INCYPHER{static_fixture}")
-        self.assertGreaterEqual(finding["flag_locations"][0]["offset"], 0)
-
-    def test_challenge_paths_accepts_work_mount_and_rejects_unapproved_paths(self) -> None:
-        with TemporaryDirectory() as temporary_directory:
-            temporary_root = Path(temporary_directory)
-            source_root = temporary_root / "agent"
-            work_root = temporary_root / "work"
-            other_root = temporary_root / "other"
-            for root in (source_root, work_root, other_root):
-                root.mkdir()
-            permitted = work_root / "challenge.bin"
-            rejected = other_root / "untrusted.bin"
-            permitted.write_bytes(b"artifact")
-            rejected.write_bytes(b"artifact")
-            with patch.object(
-                file_chal,
-                "_ALLOWED_ARTIFACT_ROOTS",
-                (source_root.resolve(), work_root.resolve()),
-            ):
-                paths = file_chal._challenge_paths(
-                    {"file_path": str(permitted), "file_paths": [str(rejected)]}
-                )
-                self.assertEqual(
-                    file_chal._artifact_workspace_root(permitted.resolve()), work_root.resolve()
-                )
-                with self.assertRaises(ValueError):
-                    file_chal._artifact_workspace_root(rejected.resolve())
-        self.assertEqual(paths, [permitted.resolve()])
-
-    def test_linux_elf_with_execute_permission_is_probe_eligible(self) -> None:
-        with TemporaryDirectory() as temporary_directory:
-            artifact = Path(temporary_directory) / "challenge"
-            artifact.write_bytes(b"\x7fELFharmless-fixture")
-            with patch("tools.file_chal.os.name", "posix"), patch(
-                "tools.file_chal.os.access", return_value=True
-            ):
-                self.assertTrue(file_chal._is_locally_executable(artifact))
-
-    def test_probe_ledger_skips_identical_payloads_for_same_artifact(self) -> None:
-        payloads, entries = file_chal._unseen_probe_payloads(
-            "fixture-hash", "basic_input", (b"test",), set()
-        )
-        self.assertEqual(payloads, (b"test",))
-        known = {file_chal._probe_entry_signature(entry) for entry in entries}
-        repeated, repeated_entries = file_chal._unseen_probe_payloads(
-            "fixture-hash", "basic_input", (b"test",), known
-        )
-        self.assertEqual(repeated, ())
-        self.assertEqual(repeated_entries, [])
-
-    def test_static_pipeline_emits_only_bounded_state_machine_candidates(self) -> None:
-        with TemporaryDirectory() as temporary_directory:
-            artifact = Path(temporary_directory) / "state-machine.bin"
-            artifact.write_bytes(b"prefix UDLR suffix")
-            analysis = file_chal._static_rev_analysis(
-                artifact,
-                {"sha256": "fixture-hash", "strings": ["moves (U/D/L/R)?"]},
-            )
-        self.assertIn("UDLR", analysis["candidate_inputs"])
-        self.assertLessEqual(
-            len(analysis["candidate_inputs"]), file_chal.REV_MAX_STATIC_CANDIDATES
-        )
-
-    @patch("tools.file_chal.append_context_list")
-    @patch("tools.file_chal._challenge_paths")
-    @patch("tools.file_chal.get_context")
-    def test_rev_delegator_returns_a_static_flag_before_dynamic_probing(
-        self, get_context, paths, append_attempt
-    ) -> None:
-        fixture = Path(__file__).parent / "fixtures" / "rev_static_fixture.bin"
-        get_context.return_value = {"category": "rev", "file_paths": [str(fixture)]}
-        paths.return_value = [fixture]
-        self.assertEqual(file_chal.file_chal_solver(58), "INCYPHER{static_fixture}")
-        self.assertEqual(append_attempt.call_count, 2)
-
-    @patch("tools.file_chal.append_context_list")
-    @patch("tools.file_chal._probe_executable", return_value=([{"response": "no flag"}], None))
-    @patch("tools.file_chal._is_locally_executable", return_value=True)
-    @patch("tools.file_chal._reconnaissance", return_value=({"format": "PE"}, None))
-    @patch("tools.file_chal._challenge_paths")
-    @patch("tools.file_chal.get_context")
-    def test_rev_delegator_records_harmless_dynamic_probe_observations(
-        self, get_context, paths, _recon, _executable, probe, append_attempt
-    ) -> None:
-        fixture = Path(__file__).parent / "fixtures" / "rev_static_fixture.bin"
-        get_context.return_value = {"category": "rev", "file_paths": [str(fixture)]}
-        paths.return_value = [fixture]
-        self.assertIsNone(file_chal.file_chal_solver(59))
-        probe.assert_called_once_with(fixture, file_chal._HARMLESS_INPUTS)
-        self.assertGreaterEqual(append_attempt.call_count, 6)
-
-    def test_xor_key_and_byte_hash_rainbow_helpers_are_bounded(self) -> None:
-        self.assertEqual(file_chal.derive_xor_key(b"\x11\x22", b"\x10\x20"), b"\x01\x02")
-        table = file_chal.build_byte_hash_rainbow_table("sha256")
-        self.assertEqual(table[hashlib.sha256(b"A").hexdigest()], ord("A"))
-        self.assertEqual(len(table), 256)
-
-    def test_exploit_triage_requires_evidence_before_active_probes(self) -> None:
-        triage = file_chal._exploit_triage(
-            Path("harmless.bin"),
+    def test_tool_outputs_are_persisted_and_fed_into_the_next_turn(self) -> None:
+        action = json.dumps(
             {
-                "strings": ["gets", "printf", "sha256", "xor"],
-                "protections": {
-                    "canary": True,
-                    "pie": True,
-                    "canary_symbols": {"__stack_chk_fail": 1},
-                    "pie_relative_offsets": {"main": 2},
-                    "decryption_candidates": {"decrypt": 3},
-                },
-            },
+                "hypothesis": "Inspect the supplied local artifact first.",
+                "action": {"tool": "inspect", "artifact_path": str(self.artifact), "arguments": {}},
+            }
         )
-        self.assertTrue(triage["overflow_probe_eligible"])
-        self.assertTrue(triage["format_probe_eligible"])
-        self.assertEqual(triage["canary_symbols"], {"__stack_chk_fail": 1})
-        self.assertIn("requires_opt_in_debugger", triage["decryption_breakpoint_plan"]["status"])
+        first = FileToolResult("inspect", str(self.artifact), "ok", {"text_preview": "no flag"})
+        second = FileToolResult(
+            "inspect",
+            str(self.artifact),
+            "ok",
+            {"text_preview": "INCYPHER{offline_file_tool_test}"},
+            flag="INCYPHER{offline_file_tool_test}",
+        )
+        prompts: list[str] = []
+
+        def remember_prompt(prompt: str, **_kwargs: object) -> str:
+            prompts.append(prompt)
+            return action
+
+        with patch("tools.file_chal.call_openai", side_effect=remember_prompt), patch(
+            "tools.file_chal.execute_file_tool", side_effect=[first, second]
+        ):
+            self.assertEqual(file_chal_solver(77), "INCYPHER{offline_file_tool_test}")
+
+        stored = get_context(77)
+        self.assertIsNotNone(stored)
+        self.assertEqual(len(stored["file_tool_results"]), 2)  # type: ignore[index]
+        self.assertIn("no flag", prompts[1])
+        self.assertEqual(file_chal_progress(77)["file_solver_state"]["last_tool"], "inspect")  # type: ignore[index]
 
 
 if __name__ == "__main__":

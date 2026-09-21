@@ -13,33 +13,8 @@ from tools.flags import extract_flag_from_json
 
 MAX_INPUT_BYTES = 48 * 1024
 MAX_RECIPE_BYTES = 16 * 1024
-_NODE_BAKE_SCRIPT = r"""
-const fs = require("fs");
-const chef = require("cyberchef");
-
-async function main() {
-  const request = JSON.parse(fs.readFileSync(0, "utf8"));
-  const input = Buffer.from(request.input_b64, "base64");
-  const dish = await chef.bake(input, request.recipe);
-  const value = dish.value;
-  let result;
-  if (Buffer.isBuffer(value)) {
-    result = { encoding: "base64", value: value.toString("base64") };
-  } else if (value instanceof ArrayBuffer) {
-    result = { encoding: "base64", value: Buffer.from(value).toString("base64") };
-  } else if (ArrayBuffer.isView(value)) {
-    result = { encoding: "base64", value: Buffer.from(value.buffer).toString("base64") };
-  } else {
-    result = { encoding: "json", value: value };
-  }
-  process.stdout.write(JSON.stringify({ type: dish.type, result: result }));
-}
-
-main().catch((error) => {
-  process.stderr.write(String(error && error.stack || error));
-  process.exitCode = 1;
-});
-"""
+_RUNNER_DIRECTORY = Path(__file__).resolve().parent / "cyberchef_runner"
+_RUNNER_SCRIPT = _RUNNER_DIRECTORY / "index.cjs"
 
 
 class CyberChefError(RuntimeError):
@@ -65,7 +40,7 @@ def run_cyberchef_analysis(
 
     The CyberChef Node.js API accepts buffers and compatible saved-recipe JSON.
     This wrapper does not make network requests and requires Node.js plus the
-    local ``cyberchef`` npm package to be resolvable from the artifact directory.
+    local ``cyberchef`` npm package installed beside this module's Node.js runner.
     """
     target = Path(artifact_path).resolve()
     data = _artifact_bytes(target)
@@ -84,9 +59,9 @@ def run_cyberchef_analysis(
         {"input_b64": base64.b64encode(data).decode("ascii"), "recipe": recipe}
     ).encode("utf-8")
     process = run_external_tool(
-        [executable, "--input-type=commonjs", "--eval", _NODE_BAKE_SCRIPT],
+        [executable, str(_RUNNER_SCRIPT)],
         timeout=timeout,
-        cwd=target.parent,
+        cwd=_RUNNER_DIRECTORY,
         input_data=request,
     )
     if process.returncode != 0:

@@ -9,8 +9,9 @@ values are reserved for shared workflow context.
 ### `agent.py`
 
 - `main()` fetches each challenge detail record once, prepares its JSON context,
-  downloads file assets when needed, and delegates to the matching solver.
-  Challenges returning no valid flag are retried.
+  downloads file assets when needed, and delegates to the matching solver. An
+  exact flag returned by a solver is submitted to CTFd before the challenge is
+  considered complete; explicitly rejected submissions are retried.
 - `_delegate(challenge_type, chal_ID)` selects the web, port, or file solver
   and accepts only an exact `INCYPHER{...}` flag string.
 
@@ -108,16 +109,32 @@ All context records are JSON dictionaries stored in the local SQLite database.
 - `run_ghidra_analysis()` imports a binary into a temporary Ghidra headless
   project and returns a bounded summary, function, or defined-string report.
 - `run_cyberchef_analysis()` bakes bounded artifact bytes through the local
-  CyberChef Node.js API and returns its JSON-safe result. It requires a local
-  Node.js runtime and the `cyberchef` npm package, not an API URL.
+  CyberChef Node.js API and returns its JSON-safe result. It requires Node.js
+  and the dependency declared beside its runner in
+  `tools/file_solve_tools/cyberchef_runner/package.json`, not an API URL.
 
 ### `tools/file_chal.py`
 
-- `file_chal_solver(chal_ID)` runs an internal sequence of LLM-selected,
-  validated file-tool actions. Every action result is written immediately to
+- `file_chal_solver(chal_ID)` runs at most 20 LLM-selected, validated actions
+  per invocation. Every action result is written immediately to
   `file_tool_results` and `file_solver_state` in the challenge JSON context;
-  the next LLM turn receives that evidence. The method returns to the outer
-  orchestrator only for an observed flag or a terminal planning failure.
+  the next LLM turn receives that evidence. It returns an observed flag, a
+  terminal planning failure, or `None` after its 20-action limit so the outer
+  orchestrator can schedule another attempt.
+- `analyze_image` is a solver action for JPEG, PNG, GIF, and WebP artifacts.
+  It sends one selected local image plus a bounded question to the configured
+  vision-capable model and stores its textual analysis as durable evidence.
+- `run_executable` is available for workspace-local ELF and PE file artifacts
+  only after every discovered ZIP archive has been expanded. The file solver
+  records successful ZIP extractions, then registers exact executable paths in
+  `allowed_executables` and marks them executable for the remote solver
+  container. It supports stateful `start`, `send`, `receive`, and `close`
+  operations for one solver invocation; each result contains a logical session
+  handle and bounded transcript evidence. The existing process bounds still
+  apply: the session lifetime defaults to 180 seconds and can be configured
+  with `FILE_SOLVER_EXECUTABLE_SESSION_SECONDS` from 15 to 600 seconds, while
+  each read remains capped at 15 seconds. All live sessions close when that
+  invocation exits.
 
 ## Web challenge workflow
 
@@ -183,9 +200,11 @@ All context records are JSON dictionaries stored in the local SQLite database.
   unsuccessful attempt atomically, and returns an observed valid flag.
 - `file_chal_solver(chal_ID)` inventories downloaded artifacts, safely expands
   ZIP files, creates waveform and spectrogram PNGs for supported audio, and
-  asks the configured LLM for a bounded file-analysis result. Explicitly
-  allowlisted executables may be exposed through `ExecutableClient`; shell,
-  network, GDB, Wireshark, and Ghidra integrations are not implicit.
+  can ask the vision-capable model to analyze JPEG, PNG, GIF, or WebP evidence.
+  It returns control after 20 actions without an observed flag. Workspace-local
+  ELF/PE artifacts are automatically allowlisted for `ExecutableClient` only
+  after every discovered ZIP archive is expanded, including nested archives;
+  shell and network access are not implicit.
 
 ## Preflight
 
@@ -204,16 +223,13 @@ All context records are JSON dictionaries stored in the local SQLite database.
   minimal query.
 - `main()` runs the checks in order and returns a process exit code.
 
-## TO-DO
-
-- Complete the real file-challenge solver using the constrained executable
-  wrapper where an authorized challenge artifact requires local interaction.
-
 ## Constrained executable interaction
 
 `tools/executable_client.py` exposes local-only process interaction for
-authorized CTF artifacts.  An explicit, workspace-local executable allowlist
-is required.  It supports bounded byte/line send and receive operations,
+authorized CTF artifacts. After all discovered ZIP archives are expanded, the
+file solver automatically builds its workspace-local executable allowlist from
+ELF/PE artifacts, including ZIP extractions. It supports bounded byte/line
+send and receive operations,
 timeouts, lifecycle control, and redacted transcripts.  Receive-related
 errors expose ``partial_data`` and send-related errors expose
 ``attempted_data``; the same evidence is retained in the transcript before an

@@ -12,6 +12,7 @@ from typing import Any
 from tools.context import append_context_list, get_context, update_context
 from tools.executable_client import ExecutableClient, ExecutableClientError, ProcessPolicy
 from tools.flags import extract_flag
+from tools.send_logs import send_logs as print
 
 
 FileSolver = Callable[[int, dict[str, Any]], str | None]

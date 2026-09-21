@@ -10,6 +10,7 @@ import requests
 
 from tools.http_client import create_session, interact_http
 from tools.flags import extract_flag
+from tools.send_logs import send_logs as print
 from tools.web_solve_tools.web_context import store_form_schema
 
 

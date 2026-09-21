@@ -20,6 +20,7 @@ from typing import Any
 import requests
 
 import tools.config  # Loads .env without overriding injected environment values.
+from tools.send_logs import send_logs as print
 
 
 def get_key_quota(*, timeout: float = 10.0) -> dict[str, Any]:

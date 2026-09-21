@@ -13,6 +13,7 @@ from tools.ctfd_api import get_challenge_url
 from tools.flags import extract_flag, extract_flag_from_json
 from tools.http_client import create_session, interact_http
 from tools.llm_router import call_openai
+from tools.send_logs import send_logs as print
 from tools.web_solve_tools.graphql_workflow import (
     GraphQLOperation,
     find_graphql_endpoint,

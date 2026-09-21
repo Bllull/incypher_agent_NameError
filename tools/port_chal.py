@@ -8,6 +8,7 @@ from tools.context import append_context_list, get_context
 from tools.ctfd_api import connect_challenge_tcp
 from tools.flags import extract_flag
 from tools.llm_router import call_openai
+from tools.send_logs import send_logs as print
 
 
 def _append_attempt(chal_ID: int, **attempt: str | int) -> None:

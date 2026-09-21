@@ -12,6 +12,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import tools.config  # Load repository-local credentials before reading them.
+from tools.send_logs import send_logs as print
 from tools.context import (
     CONTEXT_DB_PATH,
     get_chal_file_path,

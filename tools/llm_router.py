@@ -8,6 +8,7 @@ from typing import Any, Sequence, TypeVar
 
 from openai import APIConnectionError, APIStatusError, OpenAI
 import tools.config  # Loads .env before the client reads its settings.
+from tools.send_logs import send_logs as print
 
 # Initialized lazily so preflight can report missing settings cleanly.
 client: OpenAI | None = None

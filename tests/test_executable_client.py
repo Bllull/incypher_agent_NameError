@@ -65,11 +65,30 @@ class ExecutableClientTests(unittest.TestCase):
             client.receive(session, 8, 0.05)
         client.close(session)
 
+    def test_timeout_retains_partial_fixture_response_in_error_and_transcript(self) -> None:
+        client = self.make_client()
+        session = client.launch(Path(sys.executable), [str(CHILD), "partial_sleep", "1"])
+        with self.assertRaises(ExecutableTimeoutError) as raised:
+            client.receive_until(session, b"!", 16, 0.5)
+        self.assertEqual(raised.exception.partial_data, b"partial")
+        payloads = [
+            base64.b64decode(event["payload_b64"])
+            for event in client.get_transcript(session)
+        ]
+        self.assertIn(b"partial", payloads)
+        client.close(session)
+
     def test_stops_fixture_when_total_output_limit_is_exceeded(self) -> None:
         client = self.make_client(max_total_output_bytes=8, max_read_bytes=32)
         session = client.launch(Path(sys.executable), [str(CHILD), "output", "16"])
-        with self.assertRaises(ExecutableOutputLimitError):
+        with self.assertRaises(ExecutableOutputLimitError) as raised:
             client.receive(session, 16, 1)
+        self.assertEqual(raised.exception.partial_data, b"X" * 16)
+        payloads = [
+            base64.b64decode(event["payload_b64"])
+            for event in client.get_transcript(session)
+        ]
+        self.assertIn(b"X" * 16, payloads)
 
     def test_transcript_is_read_only_and_redacts_fixture_secret(self) -> None:
         client = self.make_client(redact_patterns=(b"fixture-secret",))

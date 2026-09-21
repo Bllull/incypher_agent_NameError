@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import socket
+import tempfile
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import unquote, urljoin, urlparse
@@ -13,7 +14,7 @@ from urllib.parse import unquote, urljoin, urlparse
 import requests
 
 import tools.config  # Loads .env before API settings are read.
-from tools.context import get_context, update_context
+from tools.context import append_context_list, get_context, update_context
 from tools.flags import extract_flag
 from tools.tcp_client import connect_tcp
 
@@ -21,9 +22,26 @@ from tools.tcp_client import connect_tcp
 PLATFORM_URL = os.getenv("PLATFORM_URL", "https://hackathon.in-cypher.com")
 DOCKER_PLATFORM_AVAILABLE_ENV = "IN_CYPHER_DOCKER_PLATFORM_AVAILABLE"
 CHALLENGE_DOWNLOAD_DIR = (
-    Path(__file__).resolve().parent.parent / ".agent_data" / "challenge_files"
+    Path(os.getenv("IN_CYPHER_WORK_DIR", "/work")) / "challenge_files"
 )
+if not CHALLENGE_DOWNLOAD_DIR.parent.is_dir() or not os.access(CHALLENGE_DOWNLOAD_DIR.parent, os.W_OK):
+    CHALLENGE_DOWNLOAD_DIR = (
+        Path(__file__).resolve().parent.parent / ".agent_data" / "challenge_files"
+    )
 ChallengeDetails = dict[str, Any]
+
+
+class ChallengeFileDownloadError(RuntimeError):
+    """One or more CTF file assets failed after safe partial downloads."""
+
+    def __init__(self, errors: list[dict[str, str]], downloaded_paths: list[str]) -> None:
+        super().__init__(f"{len(errors)} challenge file download(s) failed")
+        self.errors = errors
+        self.downloaded_paths = downloaded_paths
+
+
+class ChallengeDeploymentError(RuntimeError):
+    """The platform did not provide an autonomous HTTP(S) challenge target."""
 
 
 class CTFdClient:
@@ -239,19 +257,50 @@ def download_challenge_files(challenge_name: str, challenge_id: int) -> list[str
 
     challenge_directory = CHALLENGE_DOWNLOAD_DIR / _challenge_directory_name(challenge_name)
     downloaded_paths: list[str] = []
+    errors: list[dict[str, str]] = []
     used_destinations: set[Path] = set()
     for index, href in enumerate(file_links, start=1):
         if not isinstance(href, str):
             continue
         file_url = urljoin(f"{PLATFORM_URL.rstrip('/')}/", href)
-        content = _client.download(file_url)
-        challenge_directory.mkdir(parents=True, exist_ok=True)
         destination = challenge_directory / _download_filename(file_url, index)
         if destination in used_destinations:
             destination = destination.with_stem(f"{destination.stem}_{index}")
-        destination.write_bytes(content)
-        used_destinations.add(destination)
-        downloaded_paths.append(str(destination.resolve()))
+        temporary_path: Path | None = None
+        try:
+            content = _client.download(file_url)
+            challenge_directory.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(
+                dir=challenge_directory,
+                prefix=f".{destination.name}.",
+                suffix=".part",
+                delete=False,
+            ) as temporary_file:
+                temporary_file.write(content)
+                temporary_file.flush()
+                os.fsync(temporary_file.fileno())
+                temporary_path = Path(temporary_file.name)
+            temporary_path.replace(destination)
+            used_destinations.add(destination)
+            downloaded_paths.append(str(destination.resolve()))
+        except Exception as exc:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            errors.append(
+                {
+                    "index": str(index),
+                    "filename": destination.name,
+                    "error": str(exc),
+                }
+            )
+    if downloaded_paths:
+        update_context(
+            {"file_path": downloaded_paths[0], "file_paths": downloaded_paths},
+            challenge_id,
+        )
+    if errors:
+        append_context_list(errors, "file_download_errors", challenge_id)
+        raise ChallengeFileDownloadError(errors, downloaded_paths)
     return downloaded_paths
 
 
@@ -266,26 +315,31 @@ def get_challenge_details(challenge_id: int) -> ChallengeDetails:
 
 
 def get_challenge_url(challenge_id: int) -> str:
-    """Deploy or request a URL using previously stored challenge context."""
+    """Deploy a URL challenge through CTFd without interactive user input."""
     context = _stored_challenge_context(challenge_id)
-    challenge_name = str(context.get("name", "unnamed"))
-    slug = re.sub(r"[^a-z0-9]+", "-", challenge_name.lower()).strip("-")
-    ctfd_page_url = f"{PLATFORM_URL.rstrip('/')}/challenges#{slug}-{challenge_id}"
-    if _docker_platform_available():
-        deployment = deploy_instance(challenge_id)
-        for key in ("url", "connection_url"):
-            deployed_url = deployment.get(key)
-            if isinstance(deployed_url, str) and deployed_url.strip():
-                return deployed_url.strip()
-        return ctfd_page_url
+    existing_url = context.get("challenge_url")
+    if isinstance(existing_url, str) and _is_http_url(existing_url):
+        return existing_url
+    if not _docker_platform_available():
+        raise ChallengeDeploymentError(
+            "Autonomous URL challenges require platform container deployment; "
+            f"set {DOCKER_PLATFORM_AVAILABLE_ENV}=true when it is available."
+        )
+    deployment = deploy_instance(challenge_id)
+    for key in ("url", "connection_url", "connection_info"):
+        deployed_url = deployment.get(key)
+        if isinstance(deployed_url, str) and _is_http_url(deployed_url):
+            target = deployed_url.strip()
+            update_context({"challenge_url": target}, challenge_id)
+            return target
+    raise ChallengeDeploymentError(
+        f"Deployment for challenge {challenge_id} did not return an HTTP(S) URL"
+    )
 
-    manual_url = input(
-        f"Deploy [{challenge_id}] {challenge_name} manually at {ctfd_page_url}, "
-        "then enter the deployed challenge URL: "
-    ).strip()
-    if not manual_url:
-        raise ValueError("A manually deployed challenge URL is required")
-    return manual_url
+
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def deploy_instance(challenge_id: int) -> dict[str, Any]:

@@ -1,23 +1,16 @@
-FROM python:3.11-slim
+FROM registry.in-cypher.com:5001/base/agent-base:latest
 
 ENV PYTHONUNBUFFERED=1
 
-# Create non-root execution user
-RUN useradd -m -s /bin/bash agentuser
-
-WORKDIR /app
+WORKDIR /opt/agent
 
 # Copy dependency list and install packages
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Copy application source code
-COPY solver.py agent.py ./
-COPY tools/ ./tools/
+COPY solver.py agent.py /opt/agent/
+COPY tools/ /opt/agent/tools/
+COPY .env /opt/agent/.env
 
-# Set owner permissions
-RUN chown -R agentuser:agentuser /app
-
-USER agentuser
-
-CMD ["python3", "agent.py"]
+ENTRYPOINT ["python3", "/opt/agent/agent.py"]

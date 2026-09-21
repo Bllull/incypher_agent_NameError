@@ -20,7 +20,18 @@ from pwn import PIPE, STDOUT, context, process
 
 
 class ExecutableClientError(RuntimeError):
-    """Base class for constrained executable-client errors."""
+    """Base class for constrained executable-client errors with I/O evidence."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        partial_data: bytes = b"",
+        attempted_data: bytes = b"",
+    ) -> None:
+        super().__init__(message)
+        self.partial_data = partial_data
+        self.attempted_data = attempted_data
 
 
 class ExecutableValidationError(ExecutableClientError):
@@ -125,27 +136,40 @@ class ExecutableClient:
         """Write one bounded byte sequence to standard input."""
         self._validate_input(data)
         session = self._session(session_id)
+        self._record(session_id, session, "send_attempt", data)
         try:
             session.tube.send(data)
         except Exception as error:
-            raise ExecutableProtocolError(f"Unable to send to process: {error}") from error
-        self._record(session_id, session, "send", data)
+            self._record(session_id, session, "send_error", str(error).encode(errors="replace"))
+            raise ExecutableProtocolError(
+                f"Unable to send to process: {error}", attempted_data=data
+            ) from error
+        self._record(session_id, session, "send_complete", data)
 
     def send_line(self, session_id: str, data: bytes = b"") -> None:
         """Write one bounded line to standard input."""
         self._validate_input(data)
         session = self._session(session_id)
+        line = data + b"\n"
+        self._record(session_id, session, "send_line_attempt", line)
         try:
             session.tube.sendline(data)
         except Exception as error:
-            raise ExecutableProtocolError(f"Unable to send line to process: {error}") from error
-        self._record(session_id, session, "send_line", data + b"\n")
+            self._record(session_id, session, "send_line_error", str(error).encode(errors="replace"))
+            raise ExecutableProtocolError(
+                f"Unable to send line to process: {error}", attempted_data=line
+            ) from error
+        self._record(session_id, session, "send_line_complete", line)
 
     def receive(self, session_id: str, max_bytes: int, timeout: float) -> bytes:
         """Read up to ``max_bytes`` bytes, respecting policy and timeout."""
         session = self._session(session_id)
         count = self._validated_read_size(max_bytes)
-        data = self._recv_once(session_id, session, count, timeout)
+        try:
+            data = self._recv_once(session, count, timeout)
+        except ExecutableClientError as error:
+            self._record(session_id, session, "receive_error", error.partial_data)
+            raise
         self._record_output(session_id, session, "receive", data)
         return data
 
@@ -162,8 +186,19 @@ class ExecutableClient:
         while len(response) < count:
             remaining = deadline - monotonic()
             if remaining <= 0:
-                raise ExecutableTimeoutError("Timed out waiting for delimiter.")
-            chunk = self._recv_once(session_id, session, 1, remaining)
+                self._raise_after_partial(
+                    session_id,
+                    session,
+                    "receive_until_timeout",
+                    ExecutableTimeoutError("Timed out waiting for delimiter."),
+                    bytes(response),
+                )
+            try:
+                chunk = self._recv_once(session, 1, remaining)
+            except ExecutableClientError as error:
+                self._raise_after_partial(
+                    session_id, session, "receive_until_error", error, bytes(response) + error.partial_data
+                )
             if not chunk:
                 break
             response.extend(chunk)
@@ -176,7 +211,9 @@ class ExecutableClient:
         if data.endswith(delimiter):
             return data
         if len(data) >= count:
-            raise ExecutableOutputLimitError("Delimiter was not found within the requested read limit.")
+            raise ExecutableOutputLimitError(
+                "Delimiter was not found within the requested read limit.", partial_data=data
+            )
         return data
 
     def receive_line(self, session_id: str, max_bytes: int, timeout: float) -> bytes:
@@ -244,7 +281,7 @@ class ExecutableClient:
             raise ExecutableValidationError("Timeout must be positive.")
         return float(timeout)
 
-    def _recv_once(self, session_id: str, session: _Session, count: int, timeout: float) -> bytes:
+    def _recv_once(self, session: _Session, count: int, timeout: float) -> bytes:
         timeout = self._validated_timeout(timeout)
         try:
             data = session.tube.recv(count, timeout=timeout)
@@ -258,10 +295,30 @@ class ExecutableClient:
 
     def _record_output(self, session_id: str, session: _Session, event_type: str, data: bytes) -> None:
         session.output_bytes += len(data)
+        self._record(session_id, session, event_type, data)
         if session.output_bytes > self.policy.max_total_output_bytes:
             self.close(session_id)
-            raise ExecutableOutputLimitError("Process exceeded its total output allowance.")
-        self._record(session_id, session, event_type, data)
+            raise ExecutableOutputLimitError(
+                "Process exceeded its total output allowance.", partial_data=data
+            )
+
+    def _raise_after_partial(
+        self,
+        session_id: str,
+        session: _Session,
+        event_type: str,
+        error: ExecutableClientError,
+        partial_data: bytes,
+    ) -> None:
+        try:
+            self._record_output(session_id, session, event_type, partial_data)
+        except ExecutableOutputLimitError as limit_error:
+            raise ExecutableOutputLimitError(
+                str(limit_error), partial_data=partial_data, attempted_data=error.attempted_data
+            ) from error
+        raise type(error)(
+            str(error), partial_data=partial_data, attempted_data=error.attempted_data
+        ) from error
 
     def _session(self, session_id: str, allow_closed: bool = False) -> _Session:
         session = self._sessions.get(session_id)

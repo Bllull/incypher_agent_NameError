@@ -5,6 +5,7 @@ Run with: ``python -m tools.preflight``.
 
 from __future__ import annotations
 
+from builtins import print as terminal_print
 import os
 import sqlite3
 import sys
@@ -12,7 +13,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import tools.config  # Load repository-local credentials before reading them.
-from tools.send_logs import send_logs as print
+from tools.send_logs import send_logs
 from tools.context import (
     CONTEXT_DB_PATH,
     get_chal_file_path,
@@ -32,6 +33,16 @@ from tools.llm_router import (
     call_openrouter,
     list_openai_models,
 )
+
+
+def print(*values: object, **kwargs: object) -> None:
+    """Send preflight status remotely, then always display it in the terminal."""
+    try:
+        send_logs(*values, **kwargs)
+    except Exception:
+        # A portal issue must not hide local diagnostics or stop preflight.
+        pass
+    terminal_print(*values, **kwargs)
 
 
 def _stored_challenge_type(challenge_id: int) -> str:
@@ -258,7 +269,7 @@ def main() -> int:
         if input("OpenRouter API key is set. Do you want to check OpenRouter models? (y/n): ").strip().lower() == "y":
             if not check_openrouter_models():
                 return 2
-    elif not check_soclaas_connection():
+    if not check_soclaas_connection():
         return 2
 
     if not os.getenv("CTFD_API_TOKEN"):

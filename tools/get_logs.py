@@ -77,6 +77,8 @@ def format_log_entry(record: Any) -> str:
         message = payload["message"]
         remaining = {key: value for key, value in payload.items() if key != "message"}
         if remaining:
+            # Keep the human-oriented message first, without discarding the
+            # structured fields that often carry solver evidence and context.
             message = f"{message} | {json.dumps(remaining, sort_keys=True, default=str)}"
     elif isinstance(payload, str):
         message = payload

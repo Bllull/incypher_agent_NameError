@@ -47,6 +47,25 @@ class GetLogsListenerTests(unittest.TestCase):
             "2026-09-22T10:00:00+00:00        |        9 | incypher-agent           | solver started",
         )
 
+    def test_format_log_entry_keeps_message_subfields(self) -> None:
+        displayed = format_log_entry(
+            {
+                "id": 10,
+                "received_at": "2026-09-22T10:01:00+00:00",
+                "source": "incypher-agent",
+                "entry": {
+                    "message": "recon complete",
+                    "evidence": {"canary": True, "offset": 72},
+                    "candidates": ["flag{fixture}"],
+                },
+            }
+        )
+
+        self.assertIn("recon complete", displayed)
+        self.assertIn('"canary": true', displayed)
+        self.assertIn('"offset": 72', displayed)
+        self.assertIn('"candidates": ["flag{fixture}"]', displayed)
+
 
 if __name__ == "__main__":
     unittest.main()

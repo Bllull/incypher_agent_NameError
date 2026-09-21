@@ -12,6 +12,9 @@ env/
 __pycache__/
 *.py[cod]
 
+# Local Node.js dependencies for the CyberChef runner
+tools/file_solve_tools/cyberchef_runner/node_modules/
+
 # Local agent context storage
 .agent_data/
 

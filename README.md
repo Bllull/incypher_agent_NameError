@@ -24,12 +24,15 @@ TEAM_KEY=your_team_key
 
 ### Optional local CyberChef support
 
-The file solver's CyberChef adapter uses the local Node.js API rather than a
-remote server. Install a compatible Node.js runtime and the package in this
-workspace when that tool is needed:
+The file solver's CyberChef adapter uses a small local Node.js application
+rather than a remote server. Its `package.json`, runner, and `node_modules`
+stay together under `tools/file_solve_tools/cyberchef_runner`; install its
+dependencies there when that tool is needed:
 
 ```powershell
-npm install --no-save cyberchef
+Push-Location tools/file_solve_tools/cyberchef_runner
+npm install
+Pop-Location
 ```
 ## Arena deployment
 
@@ -43,6 +46,21 @@ endpoint when `IN_CYPHER_DOCKER_PLATFORM_AVAILABLE=true`. The returned
 `url`, `connection_url`, or `connection_info` must be an HTTP(S) URL and is
 stored as `challenge_url`. There is no interactive URL prompt, because arena
 runs are unattended.
+
+### Downloaded executable support
+
+The remote solver container registers workspace-local ELF and PE challenge
+artifacts for the bounded `run_executable` solver action only after every
+discovered ZIP archive has been expanded. Each successful `extract_zip` action
+is recorded; after no archives remain pending, executable artifacts (including
+ZIP extractions) are marked executable for the container user and recorded in
+the challenge context. The action still has bounded arguments, input, output,
+and runtime; the container must support the artifact's executable format.
+Menu-driven binaries can be handled with stateful start, send, receive, and
+close actions during one solver invocation. Each process session has a
+180-second wall-clock lifetime by default while individual reads remain capped
+at 15 seconds. Set `FILE_SOLVER_EXECUTABLE_SESSION_SECONDS` to a value from 15
+to 600 seconds when a challenge needs more interaction time.
 
 ## Docker setup
 

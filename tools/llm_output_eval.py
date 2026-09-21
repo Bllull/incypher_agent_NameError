@@ -19,6 +19,7 @@ _WORK_ROOT = Path(os.getenv("IN_CYPHER_WORK_DIR", "/work"))
 if not _WORK_ROOT.is_dir() or not os.access(_WORK_ROOT, os.W_OK):
     _WORK_ROOT = Path(__file__).resolve().parent.parent / ".agent_data"
 OUTPUT_EVAL_DB_PATH = _WORK_ROOT / "llm_output_usage.sqlite3"
+EVAL_RESULTS_PATH = Path(os.getenv("EVAL_RESULTS_PATH", str(_WORK_ROOT / "eval_results.txt")))
 
 
 @contextmanager
@@ -120,6 +121,28 @@ def recent_model_outputs(
     ]
 
 
+def log_evaluation_result(result: str, *, challenge_id: int | None = None) -> None:
+    """Append one evaluator response to the local, human-readable result log.
+
+    This optional reporting path is deliberately best-effort, so a full or
+    unwritable volume cannot affect a solver attempt or its model evaluation.
+    """
+    if not isinstance(result, str):
+        raise ValueError("result must be a string")
+    label = "all challenges" if challenge_id is None else f"challenge {challenge_id}"
+    record = (
+        f"[{datetime.now(timezone.utc).isoformat()}] {label}\n"
+        f"{result.rstrip()}\n\n"
+    )
+    try:
+        EVAL_RESULTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with EVAL_RESULTS_PATH.open("a", encoding="utf-8") as output_file:
+            output_file.write(record)
+    except OSError:
+        # Evaluation output is auxiliary and must not interrupt a solver.
+        pass
+
+
 def digest_model_outputs(*, challenge_id: int | None = None, limit: int = 30) -> str:
     """Ask SOCLAAS to identify the best-performing and most efficient model.
 
@@ -128,7 +151,9 @@ def digest_model_outputs(*, challenge_id: int | None = None, limit: int = 30) ->
     """
     records = recent_model_outputs(challenge_id=challenge_id, limit=limit)
     if not records:
-        return "No logged model outputs are available for evaluation."
+        result = "No logged model outputs are available for evaluation."
+        log_evaluation_result(result, challenge_id=challenge_id)
+        return result
     from tools.llm_router import call_soclaas
 
     prompt = f"""Evaluate outputs from authorized CTF-solving model attempts.
@@ -142,7 +167,9 @@ repeat any exact CTF flag found in the records.
 Records:
 {json.dumps(records, ensure_ascii=False)}
 """
-    return call_soclaas(prompt, model_name="default", max_attempts=DEFAULT_EVAL_ATTEMPTS)
+    result = call_soclaas(prompt, model_name="default", max_attempts=DEFAULT_EVAL_ATTEMPTS)
+    log_evaluation_result(result, challenge_id=challenge_id)
+    return result
 
 
 DEFAULT_EVAL_ATTEMPTS = 2

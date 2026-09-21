@@ -195,9 +195,16 @@ class OutputEvaluationTests(unittest.TestCase):
             "OUTPUT_EVAL_DB_PATH",
             Path(self.temporary_directory.name) / "outputs.sqlite3",
         )
+        self.results_path_patch = patch.object(
+            llm_output_eval,
+            "EVAL_RESULTS_PATH",
+            Path(self.temporary_directory.name) / "eval_results.txt",
+        )
         self.path_patch.start()
+        self.results_path_patch.start()
 
     def tearDown(self) -> None:
+        self.results_path_patch.stop()
         self.path_patch.stop()
         self.temporary_directory.cleanup()
 
@@ -229,6 +236,9 @@ class OutputEvaluationTests(unittest.TestCase):
         result = llm_output_eval.digest_model_outputs(challenge_id=13)
         self.assertIn("best_performing_model", result)
         call_soclaas.assert_called_once()
+        saved_result = llm_output_eval.EVAL_RESULTS_PATH.read_text(encoding="utf-8")
+        self.assertIn("challenge 13", saved_result)
+        self.assertIn(result, saved_result)
 
 
 if __name__ == "__main__":

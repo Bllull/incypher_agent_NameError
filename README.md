@@ -34,6 +34,18 @@ Push-Location tools/file_solve_tools/cyberchef_runner
 npm install
 Pop-Location
 ```
+## Arena deployment
+
+The arena runs a pushed Docker image unattended. Build for Linux x86_64, push
+the newest `:latest` image to your team registry repository, and let the next
+arena cycle run it. At runtime, the arena injects `CTF_TOKEN`/`CTFD_TOKEN` and
+`CTF_BASE`/`CTFD_URL`; this agent accepts those aliases for its CTFd settings.
+
+URL challenges are deployed autonomously through CTFd's container deployment
+endpoint when `IN_CYPHER_DOCKER_PLATFORM_AVAILABLE=true`. The returned
+`url`, `connection_url`, or `connection_info` must be an HTTP(S) URL and is
+stored as `challenge_url`. There is no interactive URL prompt, because arena
+runs are unattended.
 
 ### Downloaded executable support
 

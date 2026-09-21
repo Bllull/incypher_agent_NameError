@@ -1,0 +1,4 @@
+Harmless reverse-engineering fixture
+INCYPHER{static_fixture}
+main
+print_flag

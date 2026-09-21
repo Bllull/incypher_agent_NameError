@@ -18,8 +18,14 @@ from tools.web_solve_tools.graphql_workflow import (
     find_graphql_endpoint,
     run_graphql_operations_at_endpoint,
 )
+from tools.web_solve_tools.session_auth_workflow import (
+    discover_session_surface,
+    run_session_actions,
+    validate_session_action,
+)
 from tools.web_solve_tools.webpage_access_helpers import get_form_json, submit_form
 from tools.web_solve_tools.web_context import (
+    WEB_CONTEXT_ID,
     append_web_node,
     attempted_test_keys,
     get_web_context,
@@ -31,7 +37,7 @@ from tools.web_solve_tools.web_context import (
 from tools.web_solve_tools.ssti_evidence import analyze_ssti_response
 
 
-WEB_CHALLENGE_SUBTYPES = ("SSTI", "GRAPHQL")
+WEB_CHALLENGE_SUBTYPES = ("SSTI", "GRAPHQL", "SESSION_AUTH")
 SSTI_PHASES = ("discovery", "confirmation", "filter_mapping", "capability_mapping", "retrieval")
 QUERY_CANDIDATE_FIELDS = ("name", "value", "query", "q", "search", "input", "message")
 MAX_QUERY_CANDIDATES = 10
@@ -50,6 +56,16 @@ MAX_SSTI_NO_PROGRESS_ITERATIONS = 3
 MAX_GRAPHQL_ITERATIONS = 12
 MAX_GRAPHQL_OPERATIONS_PER_ITERATION = 4
 MAX_GRAPHQL_NO_PROGRESS_ITERATIONS = 3
+SESSION_AUTH_PHASES = (
+    "route_discovery",
+    "identifier_discovery",
+    "authorization_analysis",
+    "session_analysis",
+    "retrieval",
+)
+MAX_SESSION_AUTH_ITERATIONS = 10
+MAX_SESSION_ACTIONS_PER_ITERATION = 4
+MAX_SESSION_AUTH_NO_PROGRESS_ITERATIONS = 3
 
 
 def _extract_response_flag(response: requests.Response) -> str | None:
@@ -173,7 +189,9 @@ Challenge context:
 Pruned web workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
-    return _parse_graphql_plan(call_openai(prompt, require_deep_reasoning=True))
+    return _parse_graphql_plan(
+        call_openai(prompt, require_deep_reasoning=True, chal_ID=chal_ID)
+    )
 
 
 def identify_web_subtype(chal_ID: int) -> str:
@@ -188,9 +206,10 @@ def identify_web_subtype(chal_ID: int) -> str:
     prompt = f"""You are classifying a web CTF challenge for a workflow dispatcher.
 
 Read the challenge context below and identify its subtype. Supported subtypes
-are SSTI (server-side template injection) and GRAPHQL (a GraphQL API using
-queries or mutations). Return exactly one token: SSTI, GRAPHQL, or UNKNOWN.
-Do not explain your answer.
+are SSTI (server-side template injection), GRAPHQL (a GraphQL API using
+queries or mutations), and SESSION_AUTH (session-bound authorization,
+object-access control, or a suspected signed-session weakness). Return exactly
+one token: SSTI, GRAPHQL, SESSION_AUTH, or UNKNOWN. Do not explain your answer.
 
 Challenge ID: {chal_ID}
 Challenge context:
@@ -200,7 +219,7 @@ Previously collected web workflow context:
 {json.dumps(web_context, sort_keys=True)}
 """
     try:
-        answer = call_openai(prompt).strip().upper()
+        answer = call_openai(prompt, chal_ID=chal_ID).strip().upper()
     except Exception as exc:
         print(f"[web] Challenge {chal_ID} subtype classification failed: {exc}")
         return "UNKNOWN"
@@ -209,6 +228,100 @@ Previously collected web workflow context:
     # preset vocabulary used by the dispatcher.
     match = next((subtype for subtype in WEB_CHALLENGE_SUBTYPES if subtype in answer), None)
     return match or "UNKNOWN"
+
+
+def _parse_session_auth_plan(raw_plan: str) -> dict[str, object]:
+    """Parse a bounded LLM plan for session-bound authorization testing."""
+    cleaned = raw_plan.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    plan = json.loads(cleaned)
+    if not isinstance(plan, dict):
+        raise ValueError("Session-auth LLM plan must be a JSON object")
+
+    phase = plan.get("phase")
+    hypothesis = plan.get("hypothesis")
+    actions = plan.get("actions")
+    advance_when = plan.get("advance_when")
+    fallback = plan.get("fallback")
+    if phase not in SESSION_AUTH_PHASES:
+        raise ValueError(f"Session-auth plan phase must be one of {SESSION_AUTH_PHASES}")
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError("Session-auth plan hypothesis must be a non-empty string")
+    if not isinstance(actions, list) or not all(isinstance(action, dict) for action in actions):
+        raise ValueError("Session-auth plan actions must be a list of objects")
+    if not isinstance(advance_when, str) or not isinstance(fallback, str):
+        raise ValueError("Session-auth plan advance_when and fallback must be strings")
+    return {
+        "phase": phase,
+        "hypothesis": hypothesis,
+        "actions": [validate_session_action(action) for action in actions],
+        "advance_when": advance_when,
+        "fallback": fallback,
+    }
+
+
+def _ask_for_session_auth_plan(chal_ID: int, surface: dict[str, object]) -> dict[str, object]:
+    """Ask for small, evidence-gated requests against a CTF auth boundary."""
+    challenge_context = get_context(chal_ID) or {}
+    workflow_context = pruned_web_context(chal_ID)
+    prompt = f"""You are solving an explicitly authorized, isolated CTF web challenge.
+
+The challenge may involve session-bound authorization. A session cookie can be
+a normal authorization mechanism; its presence alone does not prove a forgery
+or an access-control flaw. Work from observed routes, responses, identifiers,
+and cookie metadata. Do not guess credentials, crack signing keys, modify raw
+cookie values, access another origin, scan hosts, or use destructive requests.
+
+Choose one phase: route_discovery, identifier_discovery,
+authorization_analysis, session_analysis, or retrieval. Propose the smallest
+set of requests that distinguishes hypotheses. You may use GET or POST only.
+A GET-only range probe is allowed only when prior evidence explicitly shows an
+identifier pattern and a bounded contiguous range; it can contain at most 100
+values and must stop on the first specified status code.
+
+Return JSON only in exactly this shape:
+{{
+  "phase": "one allowed phase",
+  "hypothesis": "short evidence-based hypothesis",
+  "actions": [
+    {{
+      "kind": "request",
+      "method": "GET",
+      "path": "/same-origin-path",
+      "params": {{}},
+      "data": {{}},
+      "purpose": "observable fact this request distinguishes"
+    }}
+  ],
+  "advance_when": "observable condition for changing phase",
+  "fallback": "next evidence-gated action if the condition is absent"
+}}
+
+For a range probe, replace the action object with:
+{{
+  "kind": "range_probe",
+  "path_template": "/track/PP-{{value}}&{{value}}&",
+  "start": 1,
+  "end": 100,
+  "stop_status": 200,
+  "purpose": "why the evidenced range is worth checking"
+}}
+
+Do not include hidden chain-of-thought or a fixed exploit recipe.
+
+Challenge context:
+{json.dumps(challenge_context, sort_keys=True)}
+
+Observed landing-page session surface (cookie values intentionally omitted):
+{json.dumps(surface, sort_keys=True)}
+
+Pruned web workflow context:
+{json.dumps(workflow_context, sort_keys=True)}
+"""
+    return _parse_session_auth_plan(
+        call_openai(prompt, require_deep_reasoning=True)
+    )
 
 
 def _parse_ssti_plan(raw_plan: str, form_fields: dict[str, object]) -> dict[str, object]:
@@ -309,7 +422,7 @@ Initial response excerpt:
 {initial_response.text[:MAX_QUERY_DISCOVERY_PAGE_CHARS]}
 """
     try:
-        suggested = _parse_query_field_candidates(call_openai(prompt))
+        suggested = _parse_query_field_candidates(call_openai(prompt, chal_ID=chal_ID))
     except Exception as exc:
         print(f"[web][SSTI] Query-field discovery failed: {exc}")
         suggested = []
@@ -399,7 +512,7 @@ Pruned workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
     return _parse_ssti_plan(
-        call_openai(prompt, require_deep_reasoning=True),
+        call_openai(prompt, require_deep_reasoning=True, chal_ID=chal_ID),
         form_schema.get("fields", {}), #type: ignore
     )
 
@@ -515,6 +628,131 @@ def _solve_ssti(chal_ID: int) -> str | None:
             stopped_node["status"] = "no_progress"
             upsert_web_node(chal_ID, stopped_node)
             return None
+    final_context = get_web_context(chal_ID)
+    final_node = final_context["nodes"][final_context["active_node_id"]]
+    final_node["status"] = "iteration_limit"
+    upsert_web_node(chal_ID, final_node)
+    return None
+
+
+def _solve_session_auth(
+    chal_ID: int,
+    *,
+    challenge_url: str | None = None,
+    session: requests.Session | None = None,
+    surface: dict[str, object] | None = None,
+    initial_responses: list[requests.Response] | None = None,
+) -> str | None:
+    """Iteratively investigate a same-origin session authorization boundary."""
+    url = challenge_url or get_challenge_url(chal_ID)
+    http = session or create_session()
+    if surface is None or initial_responses is None:
+        surface, initial_responses = discover_session_surface(http, url)
+        landing_flag = next(
+            (found for response in initial_responses if (found := _extract_response_flag(response))),
+            None,
+        )
+        surface_evidence = [
+            f"Observed route: {route}"
+            for route in surface.get("routes", [])
+            if isinstance(route, str)
+        ]
+        surface_evidence.extend(
+            f"Observed cookie metadata for: {cookie.get('name')}"
+            for cookie in surface.get("cookies", [])
+            if isinstance(cookie, dict) and isinstance(cookie.get("name"), str)
+        )
+        append_web_node(
+            chal_ID,
+            parent_id=get_web_context(chal_ID)["active_node_id"],
+            inference="Collected initial same-origin routes and session cookie metadata.",
+            field_vars_to_test=[{"method": "GET", "path": "/"}],
+            responses=[
+                {
+                    "field": {"method": "GET", "path": "/"},
+                    "status_code": response.status_code,
+                    "url": response.url,
+                    "text": response.text[:4000],
+                }
+                for response in initial_responses
+            ],
+            subsequent_steps=["Choose the smallest route or identifier test supported by this surface."],
+            phase="route_discovery",
+            evidence=surface_evidence,
+            status="flag_found" if landing_flag else "active",
+        )
+        if landing_flag:
+            return landing_flag
+
+    for iteration in range(1, MAX_SESSION_AUTH_ITERATIONS + 1):
+        plan = _ask_for_session_auth_plan(chal_ID, surface)
+        actions = plan["actions"]
+        assert isinstance(actions, list)
+        if len(actions) > MAX_SESSION_ACTIONS_PER_ITERATION:
+            print(
+                f"[web][SESSION_AUTH] Iteration {iteration} suggested {len(actions)} "
+                f"actions; capping at {MAX_SESSION_ACTIONS_PER_ITERATION}."
+            )
+            actions = actions[:MAX_SESSION_ACTIONS_PER_ITERATION]
+        if not actions:
+            append_web_node(
+                chal_ID,
+                parent_id=get_web_context(chal_ID)["active_node_id"],
+                inference=str(plan["hypothesis"]),
+                field_vars_to_test=[],
+                responses=[],
+                subsequent_steps=[str(plan["fallback"])],
+                phase=str(plan["phase"]),
+                status="stalled",
+            )
+            return None
+
+        records, responses = run_session_actions(http, url, actions)
+        response_records = [
+            {
+                "field": record.get("action"),
+                "status_code": record.get("status_code"),
+                "url": record.get("url"),
+                "text": record.get("text", ""),
+                "attempts": record.get("attempts"),
+                "matched": record.get("matched"),
+            }
+            for record in records
+        ]
+        evidence = [
+            f"{record.get('action', {}).get('kind', 'request')} returned "
+            f"status {record.get('status_code')}"
+            for record in records
+            if isinstance(record.get("action"), dict)
+        ]
+        flag = next(
+            (found for response in responses if (found := _extract_response_flag(response))),
+            None,
+        )
+        append_web_node(
+            chal_ID,
+            parent_id=get_web_context(chal_ID)["active_node_id"],
+            inference=str(plan["hypothesis"]),
+            field_vars_to_test=actions,
+            responses=response_records,
+            subsequent_steps=[str(plan["advance_when"]), str(plan["fallback"])],
+            phase=str(plan["phase"]),
+            evidence=evidence,
+            status="flag_found" if flag else "active",
+        )
+        if flag:
+            return flag
+        if has_recent_evidence_stall(chal_ID, MAX_SESSION_AUTH_NO_PROGRESS_ITERATIONS):
+            print(
+                "[web][SESSION_AUTH] Stopping after "
+                f"{MAX_SESSION_AUTH_NO_PROGRESS_ITERATIONS} no-progress iterations."
+            )
+            stopped_context = get_web_context(chal_ID)
+            stopped_node = stopped_context["nodes"][stopped_context["active_node_id"]]
+            stopped_node["status"] = "no_progress"
+            upsert_web_node(chal_ID, stopped_node)
+            return None
+
     final_context = get_web_context(chal_ID)
     final_node = final_context["nodes"][final_context["active_node_id"]]
     final_node["status"] = "iteration_limit"
@@ -689,65 +927,122 @@ def _solve_graphql(chal_ID: int) -> str | None:
     return None
 
 
+def _run_passive_web_discovery(
+    chal_ID: int,
+) -> tuple[str, requests.Session, dict[str, object], list[requests.Response], str | None]:
+    """Collect the bounded initial surface used for evidence-based dispatch."""
+    challenge_url = get_challenge_url(chal_ID)
+    session = create_session()
+    surface, responses = discover_session_surface(session, challenge_url)
+    evidence = [
+        f"Observed route: {route}"
+        for route in surface.get("routes", [])
+        if isinstance(route, str)
+    ]
+    evidence.extend(
+        f"Observed cookie metadata for: {cookie.get('name')}"
+        for cookie in surface.get("cookies", [])
+        if isinstance(cookie, dict) and isinstance(cookie.get("name"), str)
+    )
+    append_web_node(
+        chal_ID,
+        parent_id=get_web_context(chal_ID)["active_node_id"],
+        inference="Bounded passive discovery collected same-origin routes and cookie metadata.",
+        field_vars_to_test=[{"method": "GET", "path": "initial passive discovery"}],
+        responses=[
+            {
+                "field": {"method": "GET", "path": response.url},
+                "status_code": response.status_code,
+                "url": response.url,
+                "text": response.text[:4000],
+            }
+            for response in responses
+        ],
+        subsequent_steps=["Classify from observed routes, responses, and cookie metadata."],
+        phase="route_discovery",
+        evidence=evidence,
+    )
+    flag = next(
+        (found for response in responses if (found := _extract_response_flag(response))),
+        None,
+    )
+    return challenge_url, session, surface, responses, flag
+
+
+def web_chal_progress(chal_ID: int) -> dict[str, object]:
+    """Return observed web-workflow evidence without running or resetting it."""
+    context = get_context(WEB_CONTEXT_ID) or {}
+    if context.get("challenge_id") != chal_ID:
+        return {
+            "form_schema": None,
+            "active_node_id": None,
+            "node_count": 0,
+            "observations": [],
+            "evidence": [],
+        }
+
+    nodes = context.get("nodes", {})
+    observations: list[dict[str, object]] = []
+    evidence: list[str] = []
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            for item in node.get("evidence", []):
+                if isinstance(item, str) and item not in evidence:
+                    evidence.append(item)
+            for response in node.get("responses", []):
+                if not isinstance(response, dict):
+                    continue
+                observation = {
+                    key: response[key]
+                    for key in ("field", "status_code", "url", "classification", "fingerprint")
+                    if key in response
+                }
+                text = response.get("text")
+                if isinstance(text, str):
+                    observation["text"] = text[:600]
+                if observation and observation not in observations:
+                    observations.append(observation)
+
+    return {
+        "form_schema": context.get("form_schema"),
+        "active_node_id": context.get("active_node_id"),
+        "node_count": len(nodes) if isinstance(nodes, dict) else 0,
+        "observations": observations,
+        "evidence": evidence,
+    }
+
+
 def web_chal_solver(chal_ID: int) -> str | None:
     """Classify a web challenge, then dispatch to its subtype workflow."""
     reset_web_context(chal_ID)
     context = get_context(chal_ID)
     print(f"[web] Challenge {chal_ID} context: {context!r}")
     print(f"[web] Challenge {chal_ID} file path: {get_chal_file_path(chal_ID)!r}")
-    subtype = identify_web_subtype(chal_ID)
-    print(f"[web] Challenge {chal_ID} subtype: {subtype}")
-    if subtype not in WEB_CHALLENGE_SUBTYPES:
-        print(f"[web] No workflow is implemented for subtype {subtype}.")
-        return None
 
     try:
+        challenge_url, session, surface, initial_responses, flag = _run_passive_web_discovery(
+            chal_ID
+        )
+        if flag:
+            return flag
+        subtype = identify_web_subtype(chal_ID)
+        print(f"[web] Challenge {chal_ID} subtype after passive discovery: {subtype}")
+        if subtype not in WEB_CHALLENGE_SUBTYPES:
+            print(f"[web] No workflow is implemented for subtype {subtype}.")
+            return None
         if subtype == "SSTI":
             return _solve_ssti(chal_ID)
-        return _solve_graphql(chal_ID)
+        if subtype == "GRAPHQL":
+            return _solve_graphql(chal_ID)
+        return _solve_session_auth(
+            chal_ID,
+            challenge_url=challenge_url,
+            session=session,
+            surface=surface,
+            initial_responses=initial_responses,
+        )
     except (requests.RequestException, ValueError, TypeError) as exc:
         print(f"[web] Challenge {chal_ID} {subtype} workflow failed: {exc}")
     return None   
-
-
-def web_chal_progress(chal_ID: int) -> dict[str, object]:
-    """Return read-only structured web evidence for orchestration progress."""
-    from tools.web_solve_tools.web_context import WEB_CONTEXT_ID
-
-    context = get_context(WEB_CONTEXT_ID)
-    if not context or context.get("challenge_id") != chal_ID:
-        return {"evidence": []}
-    nodes = context.get("nodes", {})
-    evidence: list[dict[str, object]] = []
-    if isinstance(nodes, dict):
-        for node in nodes.values():
-            if not isinstance(node, dict):
-                continue
-            responses = node.get("responses", [])
-            observed_responses = []
-            if isinstance(responses, list):
-                for response in responses:
-                    if isinstance(response, dict):
-                        observed_responses.append(
-                            {
-                                "fingerprint": response.get("fingerprint"),
-                                "suggestions": response.get("suggestions", []),
-                                "required_arguments": response.get("required_arguments", []),
-                                "returned_facts": response.get("returned_facts", []),
-                                "filter_terms": response.get("filter_terms", []),
-                            }
-                        )
-            evidence.append(
-                {
-                    "evidence": node.get("evidence", []),
-                    "new_evidence": node.get("new_evidence", []),
-                    "responses": observed_responses,
-                }
-            )
-    return {"evidence": evidence}
-
-def main():
-    web_chal_solver(19)
-
-if __name__ == "__main__":
-    main()

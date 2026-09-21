@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
+import hashlib
+import os
+import re
+from pathlib import Path
+from typing import Any
 
 import base64
 import json
@@ -665,9 +671,338 @@ def file_chal_progress(chal_ID: int) -> dict[str, object]:
     """Return durable local-artifact evidence without running a file solver."""
     context = get_context(chal_ID) or {}
     return {
+        "category": context.get("category"),
         "file_path": context.get("file_path"),
         "file_paths": context.get("file_paths", []),
         "converted_file_paths": context.get("converted_file_paths", []),
         "file_tool_results": _recent_tool_results(context),
         "file_solver_state": context.get("file_solver_state", {}),
+    }
+
+
+_MAX_RECON_BYTES = 8 * 1024 * 1024
+_MAX_STRINGS = 200
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_WORK_ROOT = Path(os.getenv("IN_CYPHER_WORK_DIR", "/work")).resolve()
+# Artifacts may be baked into the source tree for local tests or downloaded to
+# the arena's writable work mount.  Do not accept arbitrary host paths.
+_ALLOWED_ARTIFACT_ROOTS = (_REPO_ROOT, _WORK_ROOT)
+_HARMLESS_INPUTS = (b"", b"test", b"AAAA", b"1")
+_OVERFLOW_LENGTHS = (32, 64, 128, 256)
+_FORMAT_READ_PROBES = (b"%p", b"%x", b"%08x")
+_UNSAFE_INPUT_FUNCTIONS = ("gets", "strcpy", "strcat", "sprintf", "scanf", "read")
+_FORMAT_FUNCTIONS = ("printf", "fprintf", "sprintf", "snprintf", "vprintf")
+_ENCRYPTION_MARKERS = ("xor", "encrypt", "decrypt", "aes", "sha256", "sha-256", "md5")
+
+
+def _challenge_paths(context: dict[str, Any]) -> list[Path]:
+    """Return existing artifacts beneath the source tree or writable work mount."""
+    values = context.get("file_paths", [])
+    if not isinstance(values, list):
+        values = []
+    primary = context.get("file_path")
+    if isinstance(primary, str):
+        values = [primary, *values]
+    paths: list[Path] = []
+    for value in values:
+        if not isinstance(value, str):
+            continue
+        path = Path(value).resolve()
+        if not _is_allowed_artifact_path(path):
+            continue
+        if path.is_file() and path not in paths:
+            paths.append(path)
+    return paths
+
+
+def _is_allowed_artifact_path(path: Path) -> bool:
+    """Return whether a resolved artifact path remains inside an approved root."""
+    for root in _ALLOWED_ARTIFACT_ROOTS:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _artifact_workspace_root(path: Path) -> Path:
+    """Return the approved root enclosing an already-validated artifact path."""
+    resolved_path = path.resolve()
+    for root in _ALLOWED_ARTIFACT_ROOTS:
+        try:
+            resolved_path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    raise ValueError(f"Artifact is outside approved roots: {resolved_path}")
+
+
+def _reconnaissance(path: Path) -> tuple[dict[str, object], str | None]:
+    """Collect static, bounded metadata, strings, flag candidates, and ELF protections."""
+    size = path.stat().st_size
+    with path.open("rb") as artifact:
+        data = artifact.read(_MAX_RECON_BYTES)
+    strings = [match.decode("utf-8", errors="replace") for match in re.findall(rb"[ -~]{4,}", data)]
+    strings = strings[:_MAX_STRINGS]
+    flag_locations: list[dict[str, object]] = []
+    for match in re.finditer(rb"INCYPHER\{[^\r\n}]{1,512}\}", data):
+        candidate = match.group().decode("utf-8", errors="replace")
+        flag_locations.append({"offset": match.start(), "candidate": candidate})
+    protections = _elf_protections(path, data)
+    finding: dict[str, object] = {
+        "path": str(path),
+        "size": size,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "truncated": size > len(data),
+        "magic_hex": data[:16].hex(),
+        "strings": strings,
+        "flag_locations": flag_locations,
+        "protections": protections,
+    }
+    flag = extract_flag(flag_locations[0]["candidate"]) if flag_locations else None
+    return finding, flag
+
+
+def _elf_protections(path: Path, data: bytes) -> dict[str, object]:
+    """Read ELF entrypoint, common symbols, and standard binary mitigations."""
+    if not data.startswith(b"\x7fELF"):
+        return {"format": "PE" if data.startswith(b"MZ") else "unknown"}
+    try:
+        from pwn import ELF, context as pwn_context
+
+        with pwn_context.local(log_level="error"):
+            elf = ELF(str(path), checksec=False)
+        interesting = ("_start", "main", "win", "flag", "print_flag")
+        entrypoints = {
+            name: address
+            for name, address in elf.symbols.items()
+            if name.lower() in interesting
+        }
+        return {
+            "format": "ELF",
+            "arch": elf.arch,
+            "bits": elf.bits,
+            "entrypoint": elf.entry,
+            "entrypoints": entrypoints,
+            "canary": bool(elf.canary),
+            "pie": bool(elf.pie),
+            "nx": bool(elf.nx),
+            "relro": str(elf.relro),
+            "pie_relative_offsets": {
+                name: address for name, address in elf.symbols.items() if name.lower() in interesting
+            },
+            "canary_symbols": {
+                name: address
+                for name, address in elf.symbols.items()
+                if "stack_chk" in name.lower() or "canary" in name.lower()
+            },
+            "decryption_candidates": {
+                name: address
+                for name, address in elf.symbols.items()
+                if any(marker in name.lower() for marker in ("decrypt", "decode", "unpack", "copy"))
+            },
+        }
+    except Exception as error:
+        return {"format": "ELF", "parse_error": str(error)}
+
+
+def _is_locally_executable(path: Path) -> bool:
+    """Restrict dynamic probes to native executables suitable for this host."""
+    with path.open("rb") as artifact:
+        magic = artifact.read(4)
+    if os.name == "nt":
+        return magic == b"MZ" and path.suffix.lower() in {".exe", ".com"}
+    return magic == b"\x7fELF" and os.access(path, os.X_OK)
+
+
+def _probe_executable(
+    path: Path, payloads: tuple[bytes, ...] = _HARMLESS_INPUTS
+) -> tuple[list[dict[str, object]], str | None]:
+    """Run harmless bounded line-input probes through ``ExecutableClient``."""
+    client = ExecutableClient(
+        ProcessPolicy(
+            workspace_root=_artifact_workspace_root(path),
+            allowed_executables=(path,),
+            max_runtime_seconds=5,
+            max_read_bytes=2_048,
+            max_total_output_bytes=16_384,
+        )
+    )
+    observations: list[dict[str, object]] = []
+    for payload in payloads:
+        session_id: str | None = None
+        try:
+            session_id = client.launch(path)
+            opening = _receive_available(client, session_id)
+            client.send_line(session_id, payload)
+            response = _receive_available(client, session_id)
+            text = (opening + response).decode("utf-8", errors="replace")
+            observation = {"path": str(path), "input": payload.decode("ascii"), "response": text[:2_048]}
+            observations.append(observation)
+            flag = extract_flag(text)
+            if flag:
+                return observations, flag
+        except ExecutableClientError as error:
+            observations.append(
+                {
+                    "path": str(path),
+                    "input": payload.decode("ascii"),
+                    "error": str(error),
+                    "partial_response": error.partial_data.decode("utf-8", errors="replace")[:2_048],
+                }
+            )
+        finally:
+            if session_id is not None:
+                client.close(session_id)
+    return observations, None
+
+
+def _receive_available(client: ExecutableClient, session_id: str) -> bytes:
+    """Treat an initial no-output timeout as an ordinary probe observation."""
+    try:
+        return client.receive(session_id, 2_048, 0.5)
+    except ExecutableClientError as error:
+        return error.partial_data
+
+
+def _exploit_triage(path: Path, finding: dict[str, object]) -> dict[str, object]:
+    """Create evidence-gated overflow, format, encryption, and debugger plans."""
+    strings = finding.get("strings", [])
+    strings = [value.lower() for value in strings if isinstance(value, str)]
+    protections = finding.get("protections", {})
+    protections = protections if isinstance(protections, dict) else {}
+    unsafe_functions = sorted(
+        {name for name in _UNSAFE_INPUT_FUNCTIONS if any(name in value for value in strings)}
+    )
+    format_functions = sorted(
+        {name for name in _FORMAT_FUNCTIONS if any(name in value for value in strings)}
+    )
+    encryption_markers = sorted(
+        {name for name in _ENCRYPTION_MARKERS if any(name in value for value in strings)}
+    )
+    canary_present = bool(protections.get("canary"))
+    pie_present = bool(protections.get("pie"))
+    return {
+        "path": str(path),
+        "unsafe_input_functions": unsafe_functions,
+        "format_functions": format_functions,
+        "encryption_markers": encryption_markers,
+        "canary_present": canary_present,
+        "canary_symbols": protections.get("canary_symbols", {}),
+        "pie_present": pie_present,
+        "pie_relative_offsets": protections.get("pie_relative_offsets", {}),
+        "decryption_breakpoint_plan": {
+            "candidates": protections.get("decryption_candidates", {}),
+            "status": "requires_opt_in_debugger_outside_executable_client",
+        },
+        "overflow_probe_eligible": bool(unsafe_functions),
+        "format_probe_eligible": bool(format_functions),
+        "return_address_overwrite_status": (
+            "requires_verified_offset_and_runtime_mitigation_evidence"
+            if canary_present or pie_present
+            else "requires_verified_offset_from_bounded_crash_triage"
+        ),
+        "encryption_analysis_plan": _encryption_analysis_plan(encryption_markers),
+    }
+
+
+def _probe_overflow_boundaries(path: Path) -> tuple[list[dict[str, object]], str | None]:
+    """Use bounded cyclic-style padding to identify crash/length boundaries.
+
+    This does not construct a control-flow payload. A return-address overwrite
+    requires a verified offset plus runtime mitigation evidence first.
+    """
+    payloads = tuple(b"A" * length for length in _OVERFLOW_LENGTHS)
+    return _run_input_probes(path, payloads, probe_type="overflow_boundary")
+
+
+def _probe_format_strings(path: Path) -> tuple[list[dict[str, object]], str | None]:
+    """Test read-only C format directives; never send the write directive ``%n``."""
+    return _run_input_probes(path, _FORMAT_READ_PROBES, probe_type="format_read")
+
+
+def _run_input_probes(
+    path: Path, payloads: tuple[bytes, ...], *, probe_type: str
+) -> tuple[list[dict[str, object]], str | None]:
+    """Execute one bounded, local-only probe batch through ``ExecutableClient``."""
+    client = ExecutableClient(
+        ProcessPolicy(
+            workspace_root=_artifact_workspace_root(path),
+            allowed_executables=(path,),
+            max_runtime_seconds=5,
+            max_input_bytes=512,
+            max_read_bytes=2_048,
+            max_total_output_bytes=16_384,
+        )
+    )
+    observations: list[dict[str, object]] = []
+    for payload in payloads:
+        session_id: str | None = None
+        try:
+            session_id = client.launch(path)
+            opening = _receive_available(client, session_id)
+            client.send_line(session_id, payload)
+            response = _receive_available(client, session_id)
+            exit_code = client.poll(session_id)
+            text = (opening + response).decode("utf-8", errors="replace")
+            observations.append(
+                {
+                    "path": str(path),
+                    "probe_type": probe_type,
+                    "input": payload.decode("ascii", errors="replace"),
+                    "response": text[:2_048],
+                    "exit_code": exit_code,
+                    # A normal rejection may intentionally use exit status 1.
+                    # Subprocess-style negative values indicate signal termination.
+                    "possible_crash": isinstance(exit_code, int) and exit_code < 0,
+                }
+            )
+            flag = extract_flag(text)
+            if flag:
+                return observations, flag
+        except ExecutableClientError as error:
+            observations.append(
+                {
+                    "path": str(path),
+                    "probe_type": probe_type,
+                    "input": payload.decode("ascii", errors="replace"),
+                    "error": str(error),
+                    "partial_response": error.partial_data.decode("utf-8", errors="replace")[:2_048],
+                }
+            )
+        finally:
+            if session_id is not None:
+                client.close(session_id)
+    return observations, None
+
+
+def _encryption_analysis_plan(markers: list[str]) -> dict[str, object]:
+    """Describe bounded next steps without assuming an encryption scheme exists."""
+    if not markers:
+        return {"status": "no_static_encryption_indicator"}
+    plan: dict[str, object] = {"markers": markers}
+    if "xor" in markers:
+        plan["xor"] = "compare known plaintext/ciphertext pairs with derive_xor_key()"
+    if "sha256" in markers or "sha-256" in markers:
+        plan["sha256"] = "use build_byte_hash_rainbow_table('sha256') for byte-sized digest matches"
+    return plan
+
+
+def derive_xor_key(ciphertext: bytes, known_plaintext: bytes) -> bytes:
+    """Derive a bytewise XOR key segment from equal-length known data pairs."""
+    if not ciphertext or len(ciphertext) != len(known_plaintext):
+        raise ValueError("ciphertext and known_plaintext must be non-empty and equal length")
+    return bytes(left ^ right for left, right in zip(ciphertext, known_plaintext))
+
+
+def build_byte_hash_rainbow_table(algorithm: str = "sha256") -> dict[str, int]:
+    """Map each one-byte input digest to its source byte for local CTF analysis."""
+    try:
+        hashlib.new(algorithm)
+    except ValueError as error:
+        raise ValueError(f"Unsupported hash algorithm: {algorithm}") from error
+    return {
+        hashlib.new(algorithm, bytes([value])).hexdigest(): value
+        for value in range(256)
     }

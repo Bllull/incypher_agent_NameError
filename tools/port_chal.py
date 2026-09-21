@@ -38,7 +38,8 @@ def port_chal_solver(chal_ID: int) -> str | None:
             "send next. Return only the exact input, with no Markdown or explanation.\n\n"
             f"Challenge ID: {chal_ID}\n"
             f"Challenge context:\n{json.dumps(context, ensure_ascii=False, sort_keys=True)}\n\n"
-            f"Service opening response:\n{opening_response}"
+            f"Service opening response:\n{opening_response}",
+            chal_ID=chal_ID,
         )
         commands = commands.strip()
         if not commands:

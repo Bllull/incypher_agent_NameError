@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from hashlib import sha256
 from collections.abc import Callable, Iterable, Mapping
@@ -11,15 +12,17 @@ from pathlib import Path
 from typing import Any, Iterator
 
 
-CONTEXT_DB_PATH = (
-    Path(__file__).resolve().parent.parent / ".agent_data" / "challenge_contexts.sqlite3"
-)
+_WORK_ROOT = Path(os.getenv("IN_CYPHER_WORK_DIR", "/work"))
+if not _WORK_ROOT.is_dir() or not os.access(_WORK_ROOT, os.W_OK):
+    _WORK_ROOT = Path(__file__).resolve().parent.parent / ".agent_data"
+CONTEXT_DB_PATH = _WORK_ROOT / "challenge_contexts.sqlite3"
 Context = dict[str, Any]
 _NON_PROGRESS_FIELDS = {
     "solver_scheduler",
     "solver_errors",
     "port_attempts",
     "file_download_errors",
+    "file_solver_attempts",
 }
 
 

@@ -173,7 +173,9 @@ Challenge context:
 Pruned web workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
-    return _parse_graphql_plan(call_openai(prompt, require_deep_reasoning=True))
+    return _parse_graphql_plan(
+        call_openai(prompt, require_deep_reasoning=True, chal_ID=chal_ID)
+    )
 
 
 def identify_web_subtype(chal_ID: int) -> str:
@@ -200,7 +202,7 @@ Previously collected web workflow context:
 {json.dumps(web_context, sort_keys=True)}
 """
     try:
-        answer = call_openai(prompt).strip().upper()
+        answer = call_openai(prompt, chal_ID=chal_ID).strip().upper()
     except Exception as exc:
         print(f"[web] Challenge {chal_ID} subtype classification failed: {exc}")
         return "UNKNOWN"
@@ -309,7 +311,7 @@ Initial response excerpt:
 {initial_response.text[:MAX_QUERY_DISCOVERY_PAGE_CHARS]}
 """
     try:
-        suggested = _parse_query_field_candidates(call_openai(prompt))
+        suggested = _parse_query_field_candidates(call_openai(prompt, chal_ID=chal_ID))
     except Exception as exc:
         print(f"[web][SSTI] Query-field discovery failed: {exc}")
         suggested = []
@@ -399,7 +401,7 @@ Pruned workflow context:
 {json.dumps(workflow_context, sort_keys=True)}
 """
     return _parse_ssti_plan(
-        call_openai(prompt, require_deep_reasoning=True),
+        call_openai(prompt, require_deep_reasoning=True, chal_ID=chal_ID),
         form_schema.get("fields", {}), #type: ignore
     )
 

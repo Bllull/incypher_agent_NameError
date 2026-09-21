@@ -17,6 +17,10 @@ _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _Result = TypeVar("_Result")
 
 
+class LLMResponseError(RuntimeError):
+    """The gateway returned a successful but unusable completion payload."""
+
+
 def _get_client() -> OpenAI:
     """Return the shared configured SOCLAas client."""
     global client
@@ -47,6 +51,9 @@ def _call_with_retry(
         except APIConnectionError:
             if attempt == max_attempts:
                 raise
+        except LLMResponseError:
+            if attempt == max_attempts:
+                raise
 
         delay = min(2 ** (attempt - 1), 8)
         print(
@@ -56,6 +63,18 @@ def _call_with_retry(
         time.sleep(delay)
 
     raise RuntimeError("LLM retry loop ended unexpectedly")
+
+
+def _completion_content(response: Any) -> str:
+    """Validate one chat completion before a solver uses its text."""
+    choices = getattr(response, "choices", None)
+    if not isinstance(choices, list) or not choices:
+        raise LLMResponseError("LLM response did not contain a completion choice")
+    message = getattr(choices[0], "message", None)
+    content = getattr(message, "content", None)
+    if not isinstance(content, str) or not content.strip():
+        raise LLMResponseError("LLM completion content was empty or invalid")
+    return content.strip()
 
 
 def call_openai(
@@ -72,15 +91,16 @@ def call_openai(
     if not require_deep_reasoning:
         extra_params["temperature"] = 0.0
 
-    response = _call_with_retry(
-        lambda: _get_client().chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": prompt}],
-            **extra_params,
+    return _call_with_retry(
+        lambda: _completion_content(
+            _get_client().chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": prompt}],
+                **extra_params,
+            )
         ),
         max_attempts=max_attempts,
     )
-    return response.choices[0].message.content.strip()
 
 
 def list_openai_models(
@@ -137,12 +157,13 @@ def call_multimodal_openai(
         for image_path in image_paths
     )
 
-    response = _call_with_retry(
-        lambda: _get_client().chat.completions.create(
-            model=model_name,
-            messages=[{"role": "user", "content": content}], #type: ignore
-            temperature=0.0,
+    return _call_with_retry(
+        lambda: _completion_content(
+            _get_client().chat.completions.create(
+                model=model_name,
+                messages=[{"role": "user", "content": content}], #type: ignore
+                temperature=0.0,
+            )
         ),
         max_attempts=max_attempts,
     )
-    return response.choices[0].message.content.strip() #type: ignore

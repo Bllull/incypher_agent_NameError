@@ -15,5 +15,9 @@ elif mode == "output":
     sys.stdout.flush()
 elif mode == "sleep":
     time.sleep(float(sys.argv[2]))
+elif mode == "partial_sleep":
+    sys.stdout.write("partial")
+    sys.stdout.flush()
+    time.sleep(float(sys.argv[2]))
 elif mode == "secret":
     print("token=fixture-secret", flush=True)

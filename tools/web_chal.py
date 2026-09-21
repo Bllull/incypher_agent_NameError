@@ -709,6 +709,43 @@ def web_chal_solver(chal_ID: int) -> str | None:
         print(f"[web] Challenge {chal_ID} {subtype} workflow failed: {exc}")
     return None   
 
+
+def web_chal_progress(chal_ID: int) -> dict[str, object]:
+    """Return read-only structured web evidence for orchestration progress."""
+    from tools.web_solve_tools.web_context import WEB_CONTEXT_ID
+
+    context = get_context(WEB_CONTEXT_ID)
+    if not context or context.get("challenge_id") != chal_ID:
+        return {"evidence": []}
+    nodes = context.get("nodes", {})
+    evidence: list[dict[str, object]] = []
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            responses = node.get("responses", [])
+            observed_responses = []
+            if isinstance(responses, list):
+                for response in responses:
+                    if isinstance(response, dict):
+                        observed_responses.append(
+                            {
+                                "fingerprint": response.get("fingerprint"),
+                                "suggestions": response.get("suggestions", []),
+                                "required_arguments": response.get("required_arguments", []),
+                                "returned_facts": response.get("returned_facts", []),
+                                "filter_terms": response.get("filter_terms", []),
+                            }
+                        )
+            evidence.append(
+                {
+                    "evidence": node.get("evidence", []),
+                    "new_evidence": node.get("new_evidence", []),
+                    "responses": observed_responses,
+                }
+            )
+    return {"evidence": evidence}
+
 def main():
     web_chal_solver(19)
 

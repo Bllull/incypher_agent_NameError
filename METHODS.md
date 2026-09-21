@@ -180,7 +180,22 @@ All context records are JSON dictionaries stored in the local SQLite database.
 `tools/executable_client.py` exposes local-only process interaction for
 authorized CTF artifacts.  An explicit, workspace-local executable allowlist
 is required.  It supports bounded byte/line send and receive operations,
-timeouts, lifecycle control, and redacted transcripts.  It deliberately does
+timeouts, lifecycle control, and redacted transcripts.  Receive-related
+errors expose ``partial_data`` and send-related errors expose
+``attempted_data``; the same evidence is retained in the transcript before an
+error is raised.  It deliberately does
 not expose shell execution, caller-controlled environments or working
 directories, networking, serial devices, SSH, interactive mode, debugger
 attachment, or process-memory operations.
+
+## Resilient execution loop
+
+`agent.py` keeps each challenge in an unbounded retry queue until an exact
+flag is returned. Failures are isolated per challenge. `solver_progress()`
+queries every registered solver's read-only progress snapshot and creates a
+stable hash of durable evidence while excluding retry metadata and error logs;
+unchanged evidence increases a capped exponential backoff with jitter, while
+new evidence resets it. `SolverBinding` keeps each solver's `solve()` method
+separate from its `progress()` method, so the orchestrator has no solver-
+specific state logic. Challenge-file downloads stage each asset in a temporary
+file and atomically replace the destination only after the download completes.

@@ -11,14 +11,25 @@ import tools.config  # Loads .env before the client reads its settings.
 
 # Initialized lazily so preflight can report missing settings cleanly.
 client: OpenAI | None = None
+openrouter_client: OpenAI | None = None
 
 DEFAULT_MAX_ATTEMPTS = 3
 _RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 _Result = TypeVar("_Result")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL_CYCLE = (
+    "anthropic/claude-sonnet-4",
+    "~openai/gpt-sol-latest",
+    "google/gemini-2.5-pro",
+)
 
 
 class LLMResponseError(RuntimeError):
     """The gateway returned a successful but unusable completion payload."""
+
+
+class OpenRouterUnavailableError(RuntimeError):
+    """OpenRouter is not configured or could not serve this completion."""
 
 
 def _get_client() -> OpenAI:
@@ -31,6 +42,32 @@ def _get_client() -> OpenAI:
             raise ValueError("SOCLAAS_API_KEY and SOCLAAS_BASE_URL must be set")
         client = OpenAI(api_key=api_key, base_url=base_url)
     return client
+
+
+def _get_openrouter_client() -> OpenAI:
+    """Return the OpenRouter-compatible client when its API key is configured."""
+    global openrouter_client
+    if openrouter_client is None:
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            raise OpenRouterUnavailableError("OPENROUTER_API_KEY is not set")
+        headers = {"X-OpenRouter-Title": "InCypher Agent"}
+        referer = os.getenv("OPENROUTER_HTTP_REFERER")
+        if referer:
+            headers["HTTP-Referer"] = referer
+        openrouter_client = OpenAI(
+            api_key=api_key,
+            base_url=os.getenv("OPENROUTER_BASE_URL", OPENROUTER_BASE_URL),
+            default_headers=headers,
+        )
+    return openrouter_client
+
+
+def openrouter_model_for_challenge(chal_ID: int | None) -> str:
+    """Return the removable round-robin OpenRouter model choice for a challenge."""
+    if chal_ID is None:
+        return OPENROUTER_MODEL_CYCLE[0]
+    return OPENROUTER_MODEL_CYCLE[chal_ID % len(OPENROUTER_MODEL_CYCLE)]
 
 
 def _call_with_retry(
@@ -77,27 +114,124 @@ def _completion_content(response: Any) -> str:
     return content.strip()
 
 
+def _usage_value(response: Any, field: str) -> int | None:
+    usage = getattr(response, "usage", None)
+    value = getattr(usage, field, None)
+    return value if isinstance(value, int) else None
+
+
+def _log_output(
+    *, provider: str, model: str, response: Any, content: str, chal_ID: int | None
+) -> None:
+    """Best-effort local accounting, kept separate from routing mechanics."""
+    try:
+        from tools.llm_output_eval import log_model_output
+
+        log_model_output(
+            provider=provider,
+            model=model,
+            challenge_id=chal_ID,
+            prompt_tokens=_usage_value(response, "prompt_tokens"),
+            completion_tokens=_usage_value(response, "completion_tokens"),
+            total_tokens=_usage_value(response, "total_tokens"),
+            output_text=content,
+        )
+    except Exception as error:
+        print(f"[llm] output accounting failed: {error}")
+
+
+def _complete(
+    client_instance: OpenAI,
+    *,
+    provider: str,
+    model: str,
+    prompt: str,
+    chal_ID: int | None,
+    extra_params: dict[str, Any],
+) -> str:
+    response = client_instance.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        **extra_params,
+    )
+    content = _completion_content(response)
+    _log_output(
+        provider=provider, model=model, response=response, content=content, chal_ID=chal_ID
+    )
+    return content
+
+
 def call_openai(
     prompt: str,
     require_deep_reasoning: bool = False,
     *,
+    chal_ID: int | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> str:
-    """Route prompts to the default model or the coding model for deep reasoning."""
+    """Use OpenRouter first, falling back to SOCLAAS when it is unavailable."""
     model_name = "coding" if require_deep_reasoning else "default"
-    
-    # Configure parameter based on model family
-    extra_params = {}
+    extra_params: dict[str, Any] = {}
     if not require_deep_reasoning:
         extra_params["temperature"] = 0.0
 
+    try:
+        return call_openrouter(
+            prompt,
+            chal_ID=chal_ID,
+            max_attempts=max_attempts,
+            extra_params=extra_params,
+        )
+    except (OpenRouterUnavailableError, APIConnectionError, APIStatusError, LLMResponseError) as error:
+        print(f"[llm] OpenRouter unavailable; falling back to SOCLAAS: {error}")
+    return call_soclaas(
+        prompt,
+        model_name=model_name,
+        chal_ID=chal_ID,
+        max_attempts=max_attempts,
+        extra_params=extra_params,
+    )
+
+
+def call_openrouter(
+    prompt: str,
+    *,
+    model_name: str | None = None,
+    chal_ID: int | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    extra_params: dict[str, Any] | None = None,
+) -> str:
+    """Call one OpenRouter model directly, without SOCLAAS fallback."""
+    selected_model = model_name or openrouter_model_for_challenge(chal_ID)
     return _call_with_retry(
-        lambda: _completion_content(
-            _get_client().chat.completions.create(
-                model=model_name,
-                messages=[{"role": "user", "content": prompt}],
-                **extra_params,
-            )
+        lambda: _complete(
+            _get_openrouter_client(),
+            provider="openrouter",
+            model=selected_model,
+            prompt=prompt,
+            chal_ID=chal_ID,
+            extra_params=extra_params or {},
+        ),
+        max_attempts=max_attempts,
+    )
+
+
+def call_soclaas(
+    prompt: str,
+    *,
+    model_name: str = "default",
+    chal_ID: int | None = None,
+    max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+    extra_params: dict[str, Any] | None = None,
+) -> str:
+    """Call SOCLAAS directly; used as fallback and for local-output evaluation."""
+    return _call_with_retry(
+        lambda: _complete(
+            _get_client(),
+            provider="soclaas",
+            model=model_name,
+            prompt=prompt,
+            chal_ID=chal_ID,
+            extra_params=extra_params or {},
         ),
         max_attempts=max_attempts,
     )
@@ -135,6 +269,7 @@ def call_multimodal_openai(
     image_paths: Sequence[str | Path],
     model_name: str = "qwen3-vl:32b",
     *,
+    chal_ID: int | None = None,
     max_attempts: int = DEFAULT_MAX_ATTEMPTS,
 ) -> str:
     """Send text and local images to a SOCLaas vision-capable chat model.
@@ -157,13 +292,20 @@ def call_multimodal_openai(
         for image_path in image_paths
     )
 
-    return _call_with_retry(
-        lambda: _completion_content(
-            _get_client().chat.completions.create(
+    def complete_multimodal() -> str:
+        response = _get_client().chat.completions.create(
                 model=model_name,
                 messages=[{"role": "user", "content": content}], #type: ignore
                 temperature=0.0,
             )
-        ),
-        max_attempts=max_attempts,
-    )
+        output = _completion_content(response)
+        _log_output(
+            provider="soclaas",
+            model=model_name,
+            response=response,
+            content=output,
+            chal_ID=chal_ID,
+        )
+        return output
+
+    return _call_with_retry(complete_multimodal, max_attempts=max_attempts)

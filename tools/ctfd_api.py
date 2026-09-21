@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import socket
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
@@ -22,8 +23,12 @@ from tools.tcp_client import connect_tcp
 PLATFORM_URL = os.getenv("PLATFORM_URL", "https://hackathon.in-cypher.com")
 DOCKER_PLATFORM_AVAILABLE_ENV = "IN_CYPHER_DOCKER_PLATFORM_AVAILABLE"
 CHALLENGE_DOWNLOAD_DIR = (
-    Path(__file__).resolve().parent.parent / ".agent_data" / "challenge_files"
+    Path(os.getenv("IN_CYPHER_WORK_DIR", "/work")) / "challenge_files"
 )
+if not CHALLENGE_DOWNLOAD_DIR.parent.is_dir() or not os.access(CHALLENGE_DOWNLOAD_DIR.parent, os.W_OK):
+    CHALLENGE_DOWNLOAD_DIR = (
+        Path(__file__).resolve().parent.parent / ".agent_data" / "challenge_files"
+    )
 ChallengeDetails = dict[str, Any]
 
 
@@ -34,6 +39,22 @@ class ChallengeFileDownloadError(RuntimeError):
         super().__init__(f"{len(errors)} challenge file download(s) failed")
         self.errors = errors
         self.downloaded_paths = downloaded_paths
+
+
+class ChallengeDeploymentError(RuntimeError):
+    """The platform did not provide an autonomous HTTP(S) challenge target."""
+
+
+def _mark_elf_executable(path: Path, content: bytes) -> None:
+    """Grant the downloading user execute permission for a completed ELF artifact.
+
+    ``NamedTemporaryFile`` intentionally creates files as owner-read/write only
+    (typically ``0600``).  The atomic rename preserves that mode, so Linux ELF
+    artifacts need an explicit owner-execute bit after the complete download is
+    in place.  Non-ELF attachments remain non-executable.
+    """
+    if content[:4] == b"\x7fELF":
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
 class CTFdClient:
@@ -273,6 +294,7 @@ def download_challenge_files(challenge_name: str, challenge_id: int) -> list[str
                 os.fsync(temporary_file.fileno())
                 temporary_path = Path(temporary_file.name)
             temporary_path.replace(destination)
+            _mark_elf_executable(destination, content)
             used_destinations.add(destination)
             downloaded_paths.append(str(destination.resolve()))
         except Exception as exc:
@@ -307,26 +329,31 @@ def get_challenge_details(challenge_id: int) -> ChallengeDetails:
 
 
 def get_challenge_url(challenge_id: int) -> str:
-    """Deploy or request a URL using previously stored challenge context."""
+    """Deploy a URL challenge through CTFd without interactive user input."""
     context = _stored_challenge_context(challenge_id)
-    challenge_name = str(context.get("name", "unnamed"))
-    slug = re.sub(r"[^a-z0-9]+", "-", challenge_name.lower()).strip("-")
-    ctfd_page_url = f"{PLATFORM_URL.rstrip('/')}/challenges#{slug}-{challenge_id}"
-    if _docker_platform_available():
-        deployment = deploy_instance(challenge_id)
-        for key in ("url", "connection_url"):
-            deployed_url = deployment.get(key)
-            if isinstance(deployed_url, str) and deployed_url.strip():
-                return deployed_url.strip()
-        return ctfd_page_url
+    existing_url = context.get("challenge_url")
+    if isinstance(existing_url, str) and _is_http_url(existing_url):
+        return existing_url
+    if not _docker_platform_available():
+        raise ChallengeDeploymentError(
+            "Autonomous URL challenges require platform container deployment; "
+            f"set {DOCKER_PLATFORM_AVAILABLE_ENV}=true when it is available."
+        )
+    deployment = deploy_instance(challenge_id)
+    for key in ("url", "connection_url", "connection_info"):
+        deployed_url = deployment.get(key)
+        if isinstance(deployed_url, str) and _is_http_url(deployed_url):
+            target = deployed_url.strip()
+            update_context({"challenge_url": target}, challenge_id)
+            return target
+    raise ChallengeDeploymentError(
+        f"Deployment for challenge {challenge_id} did not return an HTTP(S) URL"
+    )
 
-    manual_url = input(
-        f"Deploy [{challenge_id}] {challenge_name} manually at {ctfd_page_url}, "
-        "then enter the deployed challenge URL: "
-    ).strip()
-    if not manual_url:
-        raise ValueError("A manually deployed challenge URL is required")
-    return manual_url
+
+def _is_http_url(value: str) -> bool:
+    parsed = urlparse(value.strip())
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
 
 
 def deploy_instance(challenge_id: int) -> dict[str, Any]:

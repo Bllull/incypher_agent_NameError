@@ -26,7 +26,11 @@ from tools.ctfd_api import (
     get_challenges,
     prepare_challenge_context,
 )
-from tools.llm_router import list_openai_models
+from tools.llm_router import (
+    OPENROUTER_MODEL_CYCLE,
+    call_openrouter,
+    list_openai_models,
+)
 
 
 def _stored_challenge_type(challenge_id: int) -> str:
@@ -56,6 +60,29 @@ def check_soclaas_connection() -> bool:
         return False
 
     print(f"[+] SOCLAas API access succeeded: {len(models)} model(s) available.")
+    return True
+
+
+def check_openrouter_models() -> bool:
+    """Verify direct access to every configured OpenRouter rotation model."""
+    if not os.getenv("OPENROUTER_API_KEY"):
+        print("[*] OPENROUTER_API_KEY is not set; skipping OpenRouter model checks.")
+        return True
+    print("[*] Testing direct OpenRouter access for each configured model...")
+    for model_name in OPENROUTER_MODEL_CYCLE:
+        try:
+            response = call_openrouter(
+                "Reply with exactly OK.",
+                model_name=model_name,
+                max_attempts=1,
+            )
+        except Exception as exc:
+            print(f"[-] OpenRouter model check failed for {model_name}: {exc}")
+            return False
+        if not response:
+            print(f"[-] OpenRouter model check returned no content for {model_name}.")
+            return False
+        print(f"[+] OpenRouter model check succeeded: {model_name}.")
     return True
 
 
@@ -226,7 +253,11 @@ def check_context_sqlite_connection() -> bool:
 
 def main() -> int:
     """Run the supported endpoint, connectivity, and storage checks."""
-    if not check_soclaas_connection():
+    if os.getenv("OPENROUTER_API_KEY"):
+        if input("OpenRouter API key is set. Do you want to check OpenRouter models? (y/n): ").strip().lower() == "y":
+            if not check_openrouter_models():
+                return 2
+    elif not check_soclaas_connection():
         return 2
 
     if not os.getenv("CTFD_API_TOKEN"):

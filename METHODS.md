@@ -181,11 +181,10 @@ All context records are JSON dictionaries stored in the local SQLite database.
 
 - `port_chal_solver(chal_ID)` connects, asks the LLM for one input, records an
   unsuccessful attempt atomically, and returns an observed valid flag.
-- `file_chal_solver(chal_ID)` inventories downloaded artifacts, safely expands
-  ZIP files, creates waveform and spectrogram PNGs for supported audio, and
-  asks the configured LLM for a bounded file-analysis result. Explicitly
-  allowlisted executables may be exposed through `ExecutableClient`; shell,
-  network, GDB, Wireshark, and Ghidra integrations are not implicit.
+- `file_chal_solver(chal_ID)` delegates pwn, reverse-engineering, forensics,
+  and cryptography categories to explicit specialist handlers. The current
+  handlers are safe stubs that return `None` until implemented; they never
+  return synthetic flags.
 
 ## Preflight
 
@@ -233,3 +232,18 @@ new evidence resets it. `SolverBinding` keeps each solver's `solve()` method
 separate from its `progress()` method, so the orchestrator has no solver-
 specific state logic. Challenge-file downloads stage each asset in a temporary
 file and atomically replace the destination only after the download completes.
+
+## LLM routing and evaluation
+
+`tools/llm_router.py` tries OpenRouter before SOCLAAS when
+`OPENROUTER_API_KEY` is configured. The removable
+`openrouter_model_for_challenge()` helper rotates Claude Sonnet 4, GPT Sol, and
+Gemini 2.5 Pro by challenge ID. `tools/llm_output_eval.py` is an optional,
+separate local SQLite logger for provider/model token usage and outputs; its
+`digest_model_outputs()` helper calls SOCLAAS directly to compare output quality
+and token efficiency.
+
+`tools.preflight.check_openrouter_models()` directly probes all three rotation
+models when `OPENROUTER_API_KEY` is configured. The matching live regression
+test is opt-in: set `RUN_OPENROUTER_LIVE_TESTS=1` to make one minimal request
+per model.

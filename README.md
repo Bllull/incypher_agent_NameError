@@ -22,6 +22,16 @@ PLATFORM_URL=https://hackathon.in-cypher.com
 TEAM_KEY=your_team_key
 ```
 
+### Optional local CyberChef support
+
+The file solver's CyberChef adapter uses the local Node.js API rather than a
+remote server. Install a compatible Node.js runtime and the package in this
+workspace when that tool is needed:
+
+```powershell
+npm install --no-save cyberchef
+```
+
 ## Docker setup
 
 ```powershell

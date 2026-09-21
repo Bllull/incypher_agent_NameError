@@ -88,6 +88,37 @@ All context records are JSON dictionaries stored in the local SQLite database.
   1,000 files, more than 512 MiB of uncompressed content, and existing output
   files that would otherwise be overwritten.
 
+## File-solver tools
+
+### `tools/file_solve_tools/file_tools.py`
+
+- `FileToolRequest` and `FileToolResult` provide the JSON-safe action and
+  evidence contract for the file-solving agent.
+- `execute_file_tool(request, chal_ID)` dispatches one bounded `inspect`,
+  `gdb`, `wireshark`, `ghidra`, or `cyberchef` action and returns success or
+  error evidence without invoking an LLM. ZIP extraction, audio conversion,
+  and local executable interaction remain in `converter.py` and
+  `executable_client.py`.
+- `inspect` returns bounded metadata, magic identification, printable strings,
+  a UTF-8 preview, and an exact flag when present.
+- `run_gdb_analysis()` runs only fixed non-interactive GDB operations:
+  executable metadata, functions, variables, or one symbol disassembly.
+- `run_wireshark_analysis()` uses Wireshark's `tshark` CLI for a protocol
+  hierarchy, TCP/UDP conversation, or bounded packet-field report.
+- `run_ghidra_analysis()` imports a binary into a temporary Ghidra headless
+  project and returns a bounded summary, function, or defined-string report.
+- `run_cyberchef_analysis()` bakes bounded artifact bytes through the local
+  CyberChef Node.js API and returns its JSON-safe result. It requires a local
+  Node.js runtime and the `cyberchef` npm package, not an API URL.
+
+### `tools/file_chal.py`
+
+- `file_chal_solver(chal_ID)` runs an internal sequence of LLM-selected,
+  validated file-tool actions. Every action result is written immediately to
+  `file_tool_results` and `file_solver_state` in the challenge JSON context;
+  the next LLM turn receives that evidence. The method returns to the outer
+  orchestrator only for an observed flag or a terminal planning failure.
+
 ## Web challenge workflow
 
 ### `tools/web_chal.py`

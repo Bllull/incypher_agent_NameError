@@ -9,13 +9,16 @@ import re
 from pathlib import Path
 from typing import Any
 
-from tools.context import append_context_list, get_context
+from tools.context import append_context_list, get_context, update_context
 from tools.executable_client import ExecutableClient, ExecutableClientError, ProcessPolicy
 from tools.flags import extract_flag
 
 
 FileSolver = Callable[[int, dict[str, Any]], str | None]
 REV_SOLVER_MAX_PASSES = 5
+REV_ATTEMPT_HISTORY_LIMIT = 10
+REV_MAX_STATIC_CANDIDATES = 16
+REV_MAX_CANDIDATE_BYTES = 64
 
 
 def _category_key(category: object) -> str:
@@ -49,7 +52,10 @@ def rev_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
         _not_implemented("rev", chal_ID, context)
         return None
 
-    prior_attempts = _rev_attempt_summaries(context)
+    prior_attempts = _rev_attempt_summaries(context)[-REV_ATTEMPT_HISTORY_LIMIT:]
+    known_probes = _known_probe_signatures(context)
+    analyzed_artifacts = _analyzed_artifact_hashes(context)
+    prior_passes = _recorded_rev_passes(context)
     pass_records: list[dict[str, object]] = []
     summaries: list[dict[str, object]] = []
     for pass_number in range(1, REV_SOLVER_MAX_PASSES + 1):
@@ -58,9 +64,18 @@ def rev_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
             f"{REV_SOLVER_MAX_PASSES} with {len(prior_attempts) + len(summaries)} prior summary/summaries."
         )
         flag, report = _run_rev_solver_pass(
-            chal_ID, paths, prior_attempts=[*prior_attempts, *summaries]
+            chal_ID,
+            paths,
+            prior_attempts=[*prior_attempts, *summaries],
+            known_probes=known_probes,
+            analyzed_artifacts=analyzed_artifacts,
         )
-        ordinal = len(prior_attempts) + pass_number
+        new_probe_entries = report.pop("new_probe_entries", [])
+        if isinstance(new_probe_entries, list):
+            known_probes.update(_probe_entry_signature(entry) for entry in new_probe_entries)
+            if new_probe_entries:
+                append_context_list(new_probe_entries, "rev_probe_ledger", chal_ID, unique=True)
+        ordinal = prior_passes + pass_number
         pass_records.append(
             {
                 "pass": ordinal,
@@ -78,15 +93,20 @@ def rev_file_solver(chal_ID: int, context: dict[str, Any]) -> str | None:
         print(f"[rev] Challenge {chal_ID}: {summaries[-1]['description']}")
         if flag:
             append_context_list(pass_records, "rev_solver_passes", chal_ID, unique=True)
-            append_context_list(summaries, "rev_attempt_summaries", chal_ID, unique=True)
+            _persist_rev_attempt_summaries(chal_ID, summaries)
             return flag
     append_context_list(pass_records, "rev_solver_passes", chal_ID, unique=True)
-    append_context_list(summaries, "rev_attempt_summaries", chal_ID, unique=True)
+    _persist_rev_attempt_summaries(chal_ID, summaries)
     return None
 
 
 def _run_rev_solver_pass(
-    chal_ID: int, paths: list[Path], *, prior_attempts: list[dict[str, object]]
+    chal_ID: int,
+    paths: list[Path],
+    *,
+    prior_attempts: list[dict[str, object]],
+    known_probes: set[str],
+    analyzed_artifacts: set[str],
 ) -> tuple[str | None, dict[str, object]]:
     """Run one finite pass, carrying prior outcomes into the current solve call."""
     report: dict[str, object] = {
@@ -96,6 +116,9 @@ def _run_rev_solver_pass(
         "executable_probe_paths": 0,
         "overflow_probe_paths": 0,
         "format_probe_paths": 0,
+        "static_candidate_probe_paths": 0,
+        "static_analysis_paths": 0,
+        "new_probe_entries": [],
     }
     print(
         f"[rev] Challenge {chal_ID}: static reconnaissance of {len(paths)} local artifact(s)."
@@ -110,33 +133,81 @@ def _run_rev_solver_pass(
             return flag, report
     append_context_list(findings, "rev_reconnaissance", chal_ID, unique=True)
 
-    for path in paths:
+    baseline_probe_ran = False
+    for path, finding in zip(paths, findings):
         if not _is_locally_executable(path):
             print(f"[rev] Skipping dynamic probes for non-executable artifact: {path.name}")
             continue
-        print(f"[rev] Running bounded basic-input probes: {path.name}")
-        observations, flag = _probe_executable(path)
-        report["executable_probe_paths"] = int(report["executable_probe_paths"]) + 1
-        append_context_list(observations, "rev_input_observations", chal_ID, unique=True)
-        if flag:
-            return flag, report
+        artifact_hash = _artifact_hash(finding)
+        payloads, entries = _unseen_probe_payloads(
+            artifact_hash, "basic_input", _HARMLESS_INPUTS, known_probes
+        )
+        if payloads:
+            print(f"[rev] Running bounded basic-input probes: {path.name}")
+            observations, flag = _probe_executable(path, payloads)
+            baseline_probe_ran = True
+            report["executable_probe_paths"] = int(report["executable_probe_paths"]) + 1
+            report["new_probe_entries"].extend(entries)
+            append_context_list(observations, "rev_input_observations", chal_ID, unique=True)
+            if flag:
+                return flag, report
     for path, finding in zip(paths, findings):
         triage = _exploit_triage(path, finding)
         append_context_list([triage], "rev_exploit_triage", chal_ID, unique=True)
         if not _is_locally_executable(path):
             continue
+        artifact_hash = _artifact_hash(finding)
         if triage["overflow_probe_eligible"]:
-            print(f"[rev] Running bounded overflow-boundary probes: {path.name}")
-            observations, flag = _probe_overflow_boundaries(path)
-            report["overflow_probe_paths"] = int(report["overflow_probe_paths"]) + 1
-            append_context_list(observations, "rev_overflow_observations", chal_ID, unique=True)
-            if flag:
-                return flag, report
+            payloads, entries = _unseen_probe_payloads(
+                artifact_hash,
+                "overflow_boundary",
+                tuple(b"A" * length for length in _OVERFLOW_LENGTHS),
+                known_probes,
+            )
+            if payloads:
+                print(f"[rev] Running bounded overflow-boundary probes: {path.name}")
+                observations, flag = _run_input_probes(path, payloads, probe_type="overflow_boundary")
+                baseline_probe_ran = True
+                report["overflow_probe_paths"] = int(report["overflow_probe_paths"]) + 1
+                report["new_probe_entries"].extend(entries)
+                append_context_list(observations, "rev_overflow_observations", chal_ID, unique=True)
+                if flag:
+                    return flag, report
         if triage["format_probe_eligible"]:
-            print(f"[rev] Running read-only format-string probes: {path.name}")
-            observations, flag = _probe_format_strings(path)
-            report["format_probe_paths"] = int(report["format_probe_paths"]) + 1
-            append_context_list(observations, "rev_format_observations", chal_ID, unique=True)
+            payloads, entries = _unseen_probe_payloads(
+                artifact_hash, "format_read", _FORMAT_READ_PROBES, known_probes
+            )
+            if payloads:
+                print(f"[rev] Running read-only format-string probes: {path.name}")
+                observations, flag = _run_input_probes(path, payloads, probe_type="format_read")
+                baseline_probe_ran = True
+                report["format_probe_paths"] = int(report["format_probe_paths"]) + 1
+                report["new_probe_entries"].extend(entries)
+                append_context_list(observations, "rev_format_observations", chal_ID, unique=True)
+                if flag:
+                    return flag, report
+    if not baseline_probe_ran:
+        for path, finding in zip(paths, findings):
+            artifact_hash = _artifact_hash(finding)
+            if artifact_hash in analyzed_artifacts:
+                continue
+            analysis = _static_rev_analysis(path, finding)
+            analyzed_artifacts.add(artifact_hash)
+            report["static_analysis_paths"] = int(report["static_analysis_paths"]) + 1
+            append_context_list([analysis], "rev_static_analysis", chal_ID, unique=True)
+            if not _is_locally_executable(path):
+                continue
+            candidates = _static_candidates(analysis)
+            payloads, entries = _unseen_probe_payloads(
+                artifact_hash, "static_candidate", candidates, known_probes
+            )
+            if not payloads:
+                continue
+            print(f"[rev] Verifying {len(payloads)} static candidate input(s): {path.name}")
+            observations, flag = _run_input_probes(path, payloads, probe_type="static_candidate")
+            report["static_candidate_probe_paths"] = int(report["static_candidate_probe_paths"]) + 1
+            report["new_probe_entries"].extend(entries)
+            append_context_list(observations, "rev_static_candidate_observations", chal_ID, unique=True)
             if flag:
                 return flag, report
     return None, report
@@ -148,6 +219,195 @@ def _rev_attempt_summaries(context: dict[str, Any]) -> list[dict[str, object]]:
     if not isinstance(values, list):
         return []
     return [value for value in values if isinstance(value, dict)]
+
+
+def _persist_rev_attempt_summaries(chal_ID: int, summaries: list[dict[str, object]]) -> None:
+    """Keep only a bounded hand-off history; concrete evidence remains intact."""
+    existing = _rev_attempt_summaries(get_context(chal_ID) or {})
+    update_context(
+        {"rev_attempt_summaries": [*existing, *summaries][-REV_ATTEMPT_HISTORY_LIMIT:]},
+        chal_ID,
+    )
+
+
+def _recorded_rev_passes(context: dict[str, Any]) -> int:
+    """Return the highest persisted pass number for stable pass labels."""
+    values = context.get("rev_solver_passes", [])
+    if not isinstance(values, list):
+        return 0
+    return max(
+        (value.get("pass", 0) for value in values if isinstance(value, dict) and isinstance(value.get("pass"), int)),
+        default=0,
+    )
+
+
+def _artifact_hash(finding: dict[str, object]) -> str:
+    """Return a stable artifact identity for deterministic probe caching."""
+    value = finding.get("sha256")
+    return value if isinstance(value, str) and value else "unknown-artifact"
+
+
+def _probe_entry_signature(entry: object) -> str:
+    """Canonicalize one ledger entry without retaining the probe payload itself."""
+    if not isinstance(entry, dict):
+        return ""
+    artifact_hash = entry.get("artifact_sha256")
+    probe_type = entry.get("probe_type")
+    payload_hash = entry.get("payload_sha256")
+    if not all(isinstance(value, str) for value in (artifact_hash, probe_type, payload_hash)):
+        return ""
+    return f"{artifact_hash}:{probe_type}:{payload_hash}"
+
+
+def _known_probe_signatures(context: dict[str, Any]) -> set[str]:
+    """Read the durable probe ledger without treating it as solver progress."""
+    values = context.get("rev_probe_ledger", [])
+    if not isinstance(values, list):
+        return set()
+    return {signature for value in values if (signature := _probe_entry_signature(value))}
+
+
+def _analyzed_artifact_hashes(context: dict[str, Any]) -> set[str]:
+    """Return artifact hashes that already completed the generic static pipeline."""
+    values = context.get("rev_static_analysis", [])
+    if not isinstance(values, list):
+        return set()
+    return {
+        value["artifact_sha256"]
+        for value in values
+        if isinstance(value, dict) and isinstance(value.get("artifact_sha256"), str)
+    }
+
+
+def _unseen_probe_payloads(
+    artifact_hash: str,
+    probe_type: str,
+    payloads: tuple[bytes, ...],
+    known_signatures: set[str],
+) -> tuple[tuple[bytes, ...], list[dict[str, str]]]:
+    """Select only payloads not already executed against this exact artifact."""
+    selected: list[bytes] = []
+    entries: list[dict[str, str]] = []
+    for payload in payloads:
+        payload_hash = hashlib.sha256(payload).hexdigest()
+        entry = {
+            "artifact_sha256": artifact_hash,
+            "probe_type": probe_type,
+            "payload_sha256": payload_hash,
+        }
+        signature = _probe_entry_signature(entry)
+        if signature in known_signatures:
+            continue
+        selected.append(payload)
+        entries.append(entry)
+        known_signatures.add(signature)
+    return tuple(selected), entries
+
+
+def _static_rev_analysis(path: Path, finding: dict[str, object]) -> dict[str, object]:
+    """Run evidence-gated, format-agnostic recognizers on one local CTF artifact."""
+    data = path.read_bytes()[:_MAX_RECON_BYTES]
+    strings = finding.get("strings", [])
+    text_strings = [value for value in strings if isinstance(value, str)]
+    recognizers = [
+        _recognize_state_machine(data, text_strings),
+        _recognize_hardcoded_comparator(text_strings),
+        _recognize_transform_or_hash(text_strings),
+        _recognize_encoding_or_vm(text_strings),
+    ]
+    candidates = [
+        candidate
+        for recognizer in recognizers
+        for candidate in recognizer.pop("candidate_inputs", [])
+        if isinstance(candidate, str)
+    ][:REV_MAX_STATIC_CANDIDATES]
+    return {
+        "path": str(path),
+        "artifact_sha256": _artifact_hash(finding),
+        "pipeline": ["format", "entrypoint", "strings", "recognizers", "candidate_verifier"],
+        "recognizers": recognizers,
+        "candidate_inputs": candidates,
+    }
+
+
+def _recognize_state_machine(data: bytes, strings: list[str]) -> dict[str, object]:
+    """Find small input alphabets and embedded transition-like candidate sequences."""
+    alphabet = ""
+    for value in strings:
+        match = re.search(r"\(([A-Za-z0-9](?:/[A-Za-z0-9]){1,15})\)", value)
+        if match:
+            alphabet = "".join(match.group(1).split("/"))
+            break
+    if not alphabet:
+        return {"name": "state_machine", "status": "no_small_alphabet_evidence"}
+    candidates = _alphabet_runs(data, alphabet)
+    return {
+        "name": "state_machine",
+        "status": "small_alphabet_evidence",
+        "alphabet": alphabet,
+        "candidate_inputs": candidates,
+    }
+
+
+def _alphabet_runs(data: bytes, alphabet: str) -> list[str]:
+    """Extract bounded printable runs over an evidenced alphabet for local verification."""
+    allowed = set(alphabet.encode("ascii", errors="ignore"))
+    candidates: list[str] = []
+    current = bytearray()
+    for value in data:
+        if value in allowed:
+            current.append(value)
+            continue
+        if 2 <= len(current) <= REV_MAX_CANDIDATE_BYTES:
+            candidate = current.decode("ascii")
+            if candidate not in candidates:
+                candidates.append(candidate)
+        current.clear()
+        if len(candidates) >= REV_MAX_STATIC_CANDIDATES:
+            break
+    if 2 <= len(current) <= REV_MAX_CANDIDATE_BYTES and len(candidates) < REV_MAX_STATIC_CANDIDATES:
+        candidate = current.decode("ascii")
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates
+
+
+def _recognize_hardcoded_comparator(strings: list[str]) -> dict[str, object]:
+    """Record comparator evidence without assuming a plaintext secret exists."""
+    markers = sorted({marker for marker in ("strcmp", "strncmp", "memcmp") if marker in "\n".join(strings).lower()})
+    return {
+        "name": "hardcoded_comparator",
+        "status": "evidence" if markers else "no_evidence",
+        "markers": markers,
+    }
+
+
+def _recognize_transform_or_hash(strings: list[str]) -> dict[str, object]:
+    """Record reversible-transform and digest evidence for later specialists."""
+    lowered = "\n".join(strings).lower()
+    transforms = sorted({marker for marker in ("xor", "encrypt", "decrypt", "rotate") if marker in lowered})
+    hashes = sorted({marker for marker in ("sha256", "sha-256", "md5", "sha1") if marker in lowered})
+    return {"name": "transform_or_hash", "status": "evidence" if transforms or hashes else "no_evidence", "transforms": transforms, "hashes": hashes}
+
+
+def _recognize_encoding_or_vm(strings: list[str]) -> dict[str, object]:
+    """Record encoding and interpreter-dispatch hints without executing them."""
+    lowered = "\n".join(strings).lower()
+    encodings = sorted({marker for marker in ("base64", "zlib", "gzip", "decode") if marker in lowered})
+    vm_markers = sorted({marker for marker in ("bytecode", "opcode", "interpreter", "virtual machine") if marker in lowered})
+    return {"name": "encoding_or_vm", "status": "evidence" if encodings or vm_markers else "no_evidence", "encodings": encodings, "vm_markers": vm_markers}
+
+
+def _static_candidates(analysis: dict[str, object]) -> tuple[bytes, ...]:
+    """Return bounded printable candidates emitted by the static recognizers."""
+    values = analysis.get("candidate_inputs", [])
+    if not isinstance(values, list):
+        return ()
+    return tuple(
+        value.encode("ascii")
+        for value in values[:REV_MAX_STATIC_CANDIDATES]
+        if isinstance(value, str) and 0 < len(value.encode("ascii", errors="ignore")) <= REV_MAX_CANDIDATE_BYTES
+    )
 
 
 def _describe_rev_pass(
@@ -253,6 +513,10 @@ def file_chal_progress(chal_ID: int) -> dict[str, object]:
 _MAX_RECON_BYTES = 8 * 1024 * 1024
 _MAX_STRINGS = 200
 _REPO_ROOT = Path(__file__).resolve().parent.parent
+_WORK_ROOT = Path(os.getenv("IN_CYPHER_WORK_DIR", "/work")).resolve()
+# Artifacts may be baked into the source tree for local tests or downloaded to
+# the arena's writable work mount.  Do not accept arbitrary host paths.
+_ALLOWED_ARTIFACT_ROOTS = (_REPO_ROOT, _WORK_ROOT)
 _HARMLESS_INPUTS = (b"", b"test", b"AAAA", b"1")
 _OVERFLOW_LENGTHS = (32, 64, 128, 256)
 _FORMAT_READ_PROBES = (b"%p", b"%x", b"%08x")
@@ -262,7 +526,7 @@ _ENCRYPTION_MARKERS = ("xor", "encrypt", "decrypt", "aes", "sha256", "sha-256", 
 
 
 def _challenge_paths(context: dict[str, Any]) -> list[Path]:
-    """Return unique, existing workspace-local artifact paths from context."""
+    """Return existing artifacts beneath the source tree or writable work mount."""
     values = context.get("file_paths", [])
     if not isinstance(values, list):
         values = []
@@ -274,13 +538,34 @@ def _challenge_paths(context: dict[str, Any]) -> list[Path]:
         if not isinstance(value, str):
             continue
         path = Path(value).resolve()
-        try:
-            path.relative_to(_REPO_ROOT)
-        except ValueError:
+        if not _is_allowed_artifact_path(path):
             continue
         if path.is_file() and path not in paths:
             paths.append(path)
     return paths
+
+
+def _is_allowed_artifact_path(path: Path) -> bool:
+    """Return whether a resolved artifact path remains inside an approved root."""
+    for root in _ALLOWED_ARTIFACT_ROOTS:
+        try:
+            path.relative_to(root)
+            return True
+        except ValueError:
+            continue
+    return False
+
+
+def _artifact_workspace_root(path: Path) -> Path:
+    """Return the approved root enclosing an already-validated artifact path."""
+    resolved_path = path.resolve()
+    for root in _ALLOWED_ARTIFACT_ROOTS:
+        try:
+            resolved_path.relative_to(root)
+            return root
+        except ValueError:
+            continue
+    raise ValueError(f"Artifact is outside approved roots: {resolved_path}")
 
 
 def _reconnaissance(path: Path) -> tuple[dict[str, object], str | None]:
@@ -358,14 +643,16 @@ def _is_locally_executable(path: Path) -> bool:
         magic = artifact.read(4)
     if os.name == "nt":
         return magic == b"MZ" and path.suffix.lower() in {".exe", ".com"}
-    return magic == b"\x7fE" and os.access(path, os.X_OK)
+    return magic == b"\x7fELF" and os.access(path, os.X_OK)
 
 
-def _probe_executable(path: Path) -> tuple[list[dict[str, object]], str | None]:
+def _probe_executable(
+    path: Path, payloads: tuple[bytes, ...] = _HARMLESS_INPUTS
+) -> tuple[list[dict[str, object]], str | None]:
     """Run harmless bounded line-input probes through ``ExecutableClient``."""
     client = ExecutableClient(
         ProcessPolicy(
-            workspace_root=_REPO_ROOT,
+            workspace_root=_artifact_workspace_root(path),
             allowed_executables=(path,),
             max_runtime_seconds=5,
             max_read_bytes=2_048,
@@ -373,7 +660,7 @@ def _probe_executable(path: Path) -> tuple[list[dict[str, object]], str | None]:
         )
     )
     observations: list[dict[str, object]] = []
-    for payload in _HARMLESS_INPUTS:
+    for payload in payloads:
         session_id: str | None = None
         try:
             session_id = client.launch(path)
@@ -471,7 +758,7 @@ def _run_input_probes(
     """Execute one bounded, local-only probe batch through ``ExecutableClient``."""
     client = ExecutableClient(
         ProcessPolicy(
-            workspace_root=_REPO_ROOT,
+            workspace_root=_artifact_workspace_root(path),
             allowed_executables=(path,),
             max_runtime_seconds=5,
             max_input_bytes=512,
@@ -496,7 +783,9 @@ def _run_input_probes(
                     "input": payload.decode("ascii", errors="replace"),
                     "response": text[:2_048],
                     "exit_code": exit_code,
-                    "possible_crash": exit_code not in (None, 0),
+                    # A normal rejection may intentionally use exit status 1.
+                    # Subprocess-style negative values indicate signal termination.
+                    "possible_crash": isinstance(exit_code, int) and exit_code < 0,
                 }
             )
             flag = extract_flag(text)

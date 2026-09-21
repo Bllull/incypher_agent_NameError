@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import socket
+import stat
 import tempfile
 from pathlib import Path
 from typing import Any, Literal
@@ -42,6 +43,18 @@ class ChallengeFileDownloadError(RuntimeError):
 
 class ChallengeDeploymentError(RuntimeError):
     """The platform did not provide an autonomous HTTP(S) challenge target."""
+
+
+def _mark_elf_executable(path: Path, content: bytes) -> None:
+    """Grant the downloading user execute permission for a completed ELF artifact.
+
+    ``NamedTemporaryFile`` intentionally creates files as owner-read/write only
+    (typically ``0600``).  The atomic rename preserves that mode, so Linux ELF
+    artifacts need an explicit owner-execute bit after the complete download is
+    in place.  Non-ELF attachments remain non-executable.
+    """
+    if content[:4] == b"\x7fELF":
+        path.chmod(path.stat().st_mode | stat.S_IXUSR)
 
 
 class CTFdClient:
@@ -281,6 +294,7 @@ def download_challenge_files(challenge_name: str, challenge_id: int) -> list[str
                 os.fsync(temporary_file.fileno())
                 temporary_path = Path(temporary_file.name)
             temporary_path.replace(destination)
+            _mark_elf_executable(destination, content)
             used_destinations.add(destination)
             downloaded_paths.append(str(destination.resolve()))
         except Exception as exc:

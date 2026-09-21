@@ -39,6 +39,32 @@ class ContextProgressTests(unittest.TestCase):
         update_context({"file_paths": ["first.bin", "derived.txt"]}, 7)
         self.assertNotEqual(before, solver_progress(7))
 
+    def test_solver_progress_ignores_rev_attempt_narratives_but_tracks_observations(self) -> None:
+        store_context(
+            {
+                "name": "Harmless",
+                "rev_reconnaissance": [{"sha256": "artifact-hash"}],
+                "rev_input_observations": [{"input": "test", "response": "same"}],
+            },
+            11,
+        )
+        before = solver_progress(11)
+        append_context_list(
+            [{"pass": 1, "outcome": "no_flag"}], "rev_solver_passes", 11
+        )
+        append_context_list(
+            [{"pass": 1, "description": "Repeated static work."}],
+            "rev_attempt_summaries",
+            11,
+        )
+        self.assertEqual(before, solver_progress(11))
+        append_context_list(
+            [{"input": "test", "response": "new concrete response"}],
+            "rev_input_observations",
+            11,
+        )
+        self.assertNotEqual(before, solver_progress(11))
+
     def test_solver_progress_queries_all_read_only_sources_and_skips_failed_ones(self) -> None:
         store_context({"name": "Harmless"}, 10)
         queried: list[int] = []
@@ -101,6 +127,17 @@ class DownloadResilienceTests(unittest.TestCase):
         self.assertEqual(downloaded.read_bytes(), b"harmless-content")
         self.assertFalse(any(self.root.rglob("*.part")))
         self.assertEqual(len(get_context(9)["file_download_errors"]), 1)
+
+    @patch("tools.ctfd_api._mark_elf_executable")
+    @patch("tools.ctfd_api._client.download", return_value=b"\x7fELFharmless-fixture")
+    def test_completed_elf_download_is_marked_executable(self, download, mark_executable) -> None:
+        store_context({"file_links": ["/challenge.bin"]}, 10)
+        downloaded = download_challenge_files("Harmless", 10)
+        self.assertEqual(len(downloaded), 1)
+        mark_executable.assert_called_once()
+        path, content = mark_executable.call_args.args
+        self.assertEqual(path, Path(downloaded[0]))
+        self.assertEqual(content, b"\x7fELFharmless-fixture")
 
 
 class LLMResponseTests(unittest.TestCase):

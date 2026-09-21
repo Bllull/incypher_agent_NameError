@@ -5,6 +5,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 import hashlib
+from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from tools import file_chal
@@ -54,6 +55,67 @@ class FileChallengeDelegationTests(unittest.TestCase):
         self.assertEqual(flag, "INCYPHER{static_fixture}")
         self.assertGreaterEqual(finding["flag_locations"][0]["offset"], 0)
 
+    def test_challenge_paths_accepts_work_mount_and_rejects_unapproved_paths(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            source_root = temporary_root / "agent"
+            work_root = temporary_root / "work"
+            other_root = temporary_root / "other"
+            for root in (source_root, work_root, other_root):
+                root.mkdir()
+            permitted = work_root / "challenge.bin"
+            rejected = other_root / "untrusted.bin"
+            permitted.write_bytes(b"artifact")
+            rejected.write_bytes(b"artifact")
+            with patch.object(
+                file_chal,
+                "_ALLOWED_ARTIFACT_ROOTS",
+                (source_root.resolve(), work_root.resolve()),
+            ):
+                paths = file_chal._challenge_paths(
+                    {"file_path": str(permitted), "file_paths": [str(rejected)]}
+                )
+                self.assertEqual(
+                    file_chal._artifact_workspace_root(permitted.resolve()), work_root.resolve()
+                )
+                with self.assertRaises(ValueError):
+                    file_chal._artifact_workspace_root(rejected.resolve())
+        self.assertEqual(paths, [permitted.resolve()])
+
+    def test_linux_elf_with_execute_permission_is_probe_eligible(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            artifact = Path(temporary_directory) / "challenge"
+            artifact.write_bytes(b"\x7fELFharmless-fixture")
+            with patch("tools.file_chal.os.name", "posix"), patch(
+                "tools.file_chal.os.access", return_value=True
+            ):
+                self.assertTrue(file_chal._is_locally_executable(artifact))
+
+    def test_probe_ledger_skips_identical_payloads_for_same_artifact(self) -> None:
+        payloads, entries = file_chal._unseen_probe_payloads(
+            "fixture-hash", "basic_input", (b"test",), set()
+        )
+        self.assertEqual(payloads, (b"test",))
+        known = {file_chal._probe_entry_signature(entry) for entry in entries}
+        repeated, repeated_entries = file_chal._unseen_probe_payloads(
+            "fixture-hash", "basic_input", (b"test",), known
+        )
+        self.assertEqual(repeated, ())
+        self.assertEqual(repeated_entries, [])
+
+    def test_static_pipeline_emits_only_bounded_state_machine_candidates(self) -> None:
+        with TemporaryDirectory() as temporary_directory:
+            artifact = Path(temporary_directory) / "state-machine.bin"
+            artifact.write_bytes(b"prefix UDLR suffix")
+            analysis = file_chal._static_rev_analysis(
+                artifact,
+                {"sha256": "fixture-hash", "strings": ["moves (U/D/L/R)?"]},
+            )
+        self.assertIn("UDLR", analysis["candidate_inputs"])
+        self.assertLessEqual(
+            len(analysis["candidate_inputs"]), file_chal.REV_MAX_STATIC_CANDIDATES
+        )
+
     @patch("tools.file_chal.append_context_list")
     @patch("tools.file_chal._challenge_paths")
     @patch("tools.file_chal.get_context")
@@ -64,7 +126,7 @@ class FileChallengeDelegationTests(unittest.TestCase):
         get_context.return_value = {"category": "rev", "file_paths": [str(fixture)]}
         paths.return_value = [fixture]
         self.assertEqual(file_chal.file_chal_solver(58), "INCYPHER{static_fixture}")
-        self.assertEqual(append_attempt.call_count, 3)
+        self.assertEqual(append_attempt.call_count, 2)
 
     @patch("tools.file_chal.append_context_list")
     @patch("tools.file_chal._probe_executable", return_value=([{"response": "no flag"}], None))
@@ -79,9 +141,8 @@ class FileChallengeDelegationTests(unittest.TestCase):
         get_context.return_value = {"category": "rev", "file_paths": [str(fixture)]}
         paths.return_value = [fixture]
         self.assertIsNone(file_chal.file_chal_solver(59))
-        self.assertEqual(probe.call_count, file_chal.REV_SOLVER_MAX_PASSES)
-        probe.assert_called_with(fixture)
-        self.assertEqual(append_attempt.call_count, 3 * file_chal.REV_SOLVER_MAX_PASSES + 2)
+        probe.assert_called_once_with(fixture, file_chal._HARMLESS_INPUTS)
+        self.assertGreaterEqual(append_attempt.call_count, 6)
 
     def test_xor_key_and_byte_hash_rainbow_helpers_are_bounded(self) -> None:
         self.assertEqual(file_chal.derive_xor_key(b"\x11\x22", b"\x10\x20"), b"\x01\x02")

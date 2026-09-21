@@ -23,6 +23,10 @@ _NON_PROGRESS_FIELDS = {
     "port_attempts",
     "file_download_errors",
     "file_solver_attempts",
+    # These narrate or count attempts; they are not new solver evidence.
+    "rev_solver_passes",
+    "rev_attempt_summaries",
+    "rev_probe_ledger",
 }
 
 
@@ -129,6 +133,20 @@ def update_context(context: Context, chal_ID: int) -> None:
         )
 
 
+def deterministic_progress_evidence(context: Mapping[str, Any]) -> dict[str, Any]:
+    """Return only durable evidence suitable for retry-progress comparison.
+
+    Attempt counters, scheduler state, errors, and prose summaries can change
+    while a solver repeats identical work.  Excluding them makes progress a
+    reproducible function of artifacts and concrete solver observations.
+    """
+    return {
+        key: value
+        for key, value in context.items()
+        if key not in _NON_PROGRESS_FIELDS
+    }
+
+
 def solver_progress(
     chal_ID: int,
     progress_sources: Iterable[tuple[str, Callable[[int], Mapping[str, Any]]]] = (),
@@ -142,11 +160,7 @@ def solver_progress(
     """
     challenge_id = _validate_challenge_id(chal_ID)
     context = get_context(challenge_id) or {}
-    evidence = {
-        key: value
-        for key, value in context.items()
-        if key not in _NON_PROGRESS_FIELDS
-    }
+    evidence = deterministic_progress_evidence(context)
     solver_evidence: dict[str, Mapping[str, Any]] = {}
     for source_name, source in progress_sources:
         try:
@@ -154,7 +168,7 @@ def solver_progress(
         except Exception:
             continue
         if isinstance(snapshot, Mapping):
-            solver_evidence[source_name] = snapshot
+            solver_evidence[source_name] = deterministic_progress_evidence(snapshot)
     evidence["solver_evidence"] = solver_evidence
     canonical = json.dumps(evidence, sort_keys=True, separators=(",", ":"), default=str)
     return f"sha256:{sha256(canonical.encode('utf-8')).hexdigest()}"

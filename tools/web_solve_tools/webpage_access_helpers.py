@@ -90,7 +90,7 @@ def get_form_json(
         print(f"[web] Using cached validated form schema for {challenge_url}")
         return cached
     http = session or create_session()
-    response = interact_http(http, challenge_url, method="GET")
+    response = interact_http(http, challenge_url, method="GET", path="")
     response.raise_for_status()
     parser = _FormParser()
     parser.feed(response.text)
@@ -138,6 +138,7 @@ def submit_form(
             http,
             url,
             method=method,
+            path="",
             params=fields if method == "GET" else None,
             data=fields if method == "POST" else None,
         )

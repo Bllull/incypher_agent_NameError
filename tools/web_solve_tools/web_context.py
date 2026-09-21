@@ -9,7 +9,7 @@ from tools.context import delete_context, get_context, store_context
 
 
 WEB_CONTEXT_ID = -1000
-WEB_CONTEXT_VERSION = 2
+WEB_CONTEXT_VERSION = 3
 
 
 def _initial_context(chal_ID: int) -> dict[str, Any]:
@@ -28,6 +28,7 @@ def _initial_context(chal_ID: int) -> dict[str, Any]:
                 "field_vars_to_test": [],
                 "responses": [],
                 "phase": "discovery",
+                "input_surface": "unknown",
                 "evidence": [],
                 "new_evidence": [],
                 "subsequent_steps": [],
@@ -92,6 +93,7 @@ def append_web_node(
     responses: list[dict[str, Any]],
     subsequent_steps: list[str],
     phase: str = "discovery",
+    input_surface: str = "unknown",
     evidence: Iterable[str] = (),
     status: str = "active",
 ) -> str:
@@ -120,6 +122,7 @@ def append_web_node(
             "field_vars_to_test": field_vars_to_test,
             "responses": responses,
             "phase": phase,
+            "input_surface": input_surface,
             "evidence": node_evidence,
             "new_evidence": [item for item in node_evidence if item not in previous_evidence],
             "subsequent_steps": subsequent_steps,
@@ -164,6 +167,7 @@ def pruned_web_context(chal_ID: int, max_ancestors: int = 4) -> dict[str, Any]:
                 "field_vars_to_test": node.get("field_vars_to_test", []),
                 "responses": compact_responses,
                 "phase": node.get("phase", "discovery"),
+                "input_surface": node.get("input_surface", "unknown"),
                 "new_evidence": node.get("new_evidence", []),
                 "subsequent_steps": node.get("subsequent_steps", []),
                 "status": node.get("status", "active"),

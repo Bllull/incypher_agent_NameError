@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import re
+from urllib.parse import urlsplit, urlunsplit
 
 import requests
 
 from tools.context import get_chal_file_path, get_context
 from tools.ctfd_api import get_challenge_url
 from tools.flags import extract_flag, extract_flag_from_json
-from tools.http_client import create_session
+from tools.http_client import create_session, interact_http
 from tools.llm_router import call_openai
 from tools.web_solve_tools.graphql_workflow import (
     GraphQLOperation,
@@ -31,6 +33,10 @@ from tools.web_solve_tools.ssti_evidence import analyze_ssti_response
 
 WEB_CHALLENGE_SUBTYPES = ("SSTI", "GRAPHQL")
 SSTI_PHASES = ("discovery", "confirmation", "filter_mapping", "capability_mapping", "retrieval")
+QUERY_CANDIDATE_FIELDS = ("name", "value", "query", "q", "search", "input", "message")
+MAX_QUERY_CANDIDATES = 10
+MAX_QUERY_DISCOVERY_PAGE_CHARS = 4000
+_QUERY_FIELD_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,63}$")
 GRAPHQL_PHASES = (
     "root_field_discovery",
     "selection_discovery",
@@ -262,10 +268,88 @@ def _parse_ssti_plan(raw_plan: str, form_fields: dict[str, object]) -> dict[str,
     }
 
 
+def _parse_query_field_candidates(raw_response: str) -> list[str]:
+    """Validate a small LLM-proposed set of URL query parameter names."""
+    cleaned = raw_response.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.split("\n", 1)[1].rsplit("```", 1)[0].strip()
+    value = json.loads(cleaned)
+    if not isinstance(value, dict) or not isinstance(value.get("field_names"), list):
+        raise ValueError("Query candidate response must contain a field_names list")
+    return [
+        name
+        for name in value["field_names"]
+        if isinstance(name, str) and _QUERY_FIELD_PATTERN.fullmatch(name)
+    ]
+
+
+def _discover_query_probe_schema(
+    chal_ID: int,
+    challenge_url: str,
+    session: requests.Session,
+) -> dict[str, object]:
+    """Build a bounded GET-query input schema when a page has no usable form."""
+    initial_response = interact_http(session, challenge_url, method="GET", path="")
+    initial_response.raise_for_status()
+    challenge_context = get_context(chal_ID) or {}
+    prompt = f"""Identify likely URL query parameter names for an authorized web CTF.
+
+The page has no usable HTML form. Suggest only parameter names that could be
+useful for benign SSTI discovery probes. Derive names from the challenge
+description and initial response where possible. Do not suggest payloads,
+exploit chains, paths, or parameter values.
+
+Return JSON only:
+{{"field_names": ["short_parameter_name"]}}
+
+Challenge context:
+{json.dumps(challenge_context, sort_keys=True)}
+
+Initial response excerpt:
+{initial_response.text[:MAX_QUERY_DISCOVERY_PAGE_CHARS]}
+"""
+    try:
+        suggested = _parse_query_field_candidates(call_openai(prompt))
+    except Exception as exc:
+        print(f"[web][SSTI] Query-field discovery failed: {exc}")
+        suggested = []
+
+    fields = list(dict.fromkeys((*QUERY_CANDIDATE_FIELDS, *suggested)))
+    parsed = urlsplit(initial_response.url)
+    base_url = urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    return {
+        "url": base_url,
+        "method": "GET",
+        "fields": {field: "" for field in fields[:MAX_QUERY_CANDIDATES]},
+        "input_surface": "query",
+    }
+
+
+def _get_ssti_input_schema(
+    chal_ID: int,
+    challenge_url: str,
+    web_context: dict[str, object],
+    session: requests.Session,
+) -> dict[str, object]:
+    """Prefer validated form inputs, then fall back to URL query parameters."""
+    try:
+        schema = get_form_json(
+            challenge_url,
+            context=web_context,
+            session=session,
+            chal_ID=chal_ID,
+        )
+        return {**schema, "input_surface": "form"}
+    except ValueError as exc:
+        print(f"[web][SSTI] No usable form; probing URL query parameters instead: {exc}")
+        return _discover_query_probe_schema(chal_ID, challenge_url, session)
+
+
 def _ask_for_ssti_plan(chal_ID: int, form_schema: dict[str, object]) -> dict[str, object]:
     """Ask the LLM for the next field/value tests from a pruned branch."""
     challenge_context = get_context(chal_ID) or {}
     workflow_context = pruned_web_context(chal_ID)
+    input_surface = str(form_schema.get("input_surface", "form"))
     prompt = f"""You are iteratively solving a web CTF challenge.
 
 Use the challenge context, form schema, and recorded observations to choose
@@ -279,6 +363,13 @@ constraint at a time), capability_mapping (learn only capabilities supported
 by evidence), or retrieval (only when evidence supports a target). Prefer
 tests that distinguish hypotheses. A rejection response can be useful evidence;
 do not repeat an already submitted field/value pair.
+
+Input surface: {input_surface}. The listed schema fields are the only allowed
+input names. For a query surface, each test sends a same-origin GET request
+with one query parameter. In discovery, prefer compact benign canary probes
+and controls. A small arithmetic template-style canary may be appropriate when
+the observed challenge supports that syntax; only claim evaluation when the
+observed output supports it.
 
 Return JSON only, with exactly this shape:
 {{
@@ -318,16 +409,12 @@ def _solve_ssti(chal_ID: int) -> str | None:
     web_context = get_web_context(chal_ID)
     challenge_url = get_challenge_url(chal_ID)
     session = create_session()
-    form_schema = get_form_json(
-        challenge_url,
-        context=web_context,
-        session=session,
-        chal_ID=chal_ID,
-    )
-    print(f"[web][SSTI] Form schema: {json.dumps(form_schema, sort_keys=True)}")
+    form_schema = _get_ssti_input_schema(chal_ID, challenge_url, web_context, session)
+    print(f"[web][SSTI] Input schema: {json.dumps(form_schema, sort_keys=True)}")
     fields = form_schema.get("fields", {})
     if not isinstance(fields, dict) or not fields:
-        raise ValueError("The validated SSTI form contains no fields")
+        raise ValueError("The SSTI input schema contains no fields")
+    input_surface = str(form_schema.get("input_surface", "form"))
 
     for iteration in range(1, MAX_SSTI_ITERATIONS + 1):
         plan = _ask_for_ssti_plan(chal_ID, form_schema)
@@ -376,6 +463,7 @@ def _solve_ssti(chal_ID: int) -> str | None:
                 responses=[],
                 subsequent_steps=[str(plan["fallback"])],
                 phase=str(plan["phase"]),
+                input_surface=input_surface,
                 status="stalled",
             )
             return None
@@ -415,6 +503,7 @@ def _solve_ssti(chal_ID: int) -> str | None:
             subsequent_steps=[str(plan["advance_when"]), str(plan["fallback"])],
             phase=str(plan["phase"]),
             evidence=evidence,
+            input_surface=input_surface,
             status="flag_found" if flag else "active",
         )
         if flag:

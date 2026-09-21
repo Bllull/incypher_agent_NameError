@@ -25,6 +25,7 @@ from tools.web_solve_tools.session_auth_workflow import (
 )
 from tools.web_solve_tools.webpage_access_helpers import get_form_json, submit_form
 from tools.web_solve_tools.web_context import (
+    WEB_CONTEXT_ID,
     append_web_node,
     attempted_test_keys,
     get_web_context,
@@ -966,6 +967,51 @@ def _run_passive_web_discovery(
         None,
     )
     return challenge_url, session, surface, responses, flag
+
+
+def web_chal_progress(chal_ID: int) -> dict[str, object]:
+    """Return observed web-workflow evidence without running or resetting it."""
+    context = get_context(WEB_CONTEXT_ID) or {}
+    if context.get("challenge_id") != chal_ID:
+        return {
+            "form_schema": None,
+            "active_node_id": None,
+            "node_count": 0,
+            "observations": [],
+            "evidence": [],
+        }
+
+    nodes = context.get("nodes", {})
+    observations: list[dict[str, object]] = []
+    evidence: list[str] = []
+    if isinstance(nodes, dict):
+        for node in nodes.values():
+            if not isinstance(node, dict):
+                continue
+            for item in node.get("evidence", []):
+                if isinstance(item, str) and item not in evidence:
+                    evidence.append(item)
+            for response in node.get("responses", []):
+                if not isinstance(response, dict):
+                    continue
+                observation = {
+                    key: response[key]
+                    for key in ("field", "status_code", "url", "classification", "fingerprint")
+                    if key in response
+                }
+                text = response.get("text")
+                if isinstance(text, str):
+                    observation["text"] = text[:600]
+                if observation and observation not in observations:
+                    observations.append(observation)
+
+    return {
+        "form_schema": context.get("form_schema"),
+        "active_node_id": context.get("active_node_id"),
+        "node_count": len(nodes) if isinstance(nodes, dict) else 0,
+        "observations": observations,
+        "evidence": evidence,
+    }
 
 
 def web_chal_solver(chal_ID: int) -> str | None:

@@ -169,3 +169,18 @@ All context records are JSON dictionaries stored in the local SQLite database.
 - `check_context_sqlite_connection()` opens SQLite directly and performs a
   minimal query.
 - `main()` runs the checks in order and returns a process exit code.
+
+## TO-DO
+
+- Complete the real file-challenge solver using the constrained executable
+  wrapper where an authorized challenge artifact requires local interaction.
+
+## Constrained executable interaction
+
+`tools/executable_client.py` exposes local-only process interaction for
+authorized CTF artifacts.  An explicit, workspace-local executable allowlist
+is required.  It supports bounded byte/line send and receive operations,
+timeouts, lifecycle control, and redacted transcripts.  It deliberately does
+not expose shell execution, caller-controlled environments or working
+directories, networking, serial devices, SSH, interactive mode, debugger
+attachment, or process-memory operations.
